@@ -2,72 +2,77 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class Connect4Net(nn.Module):
-    def __init__(self, board_layers=8, board_size=5, num_channels=128, dropout=0.3):
-        super(Connect4Net, self).__init__()
-        self.board_layers = board_layers
-        self.board_size = board_size
-        
-        # Input: 1 channel (board state), Output: num_channels
-        self.conv1 = nn.Conv3d(1, num_channels, 3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm3d(num_channels)
-        
-        # Residual Blocks
-        self.res1 = ResidualBlock(num_channels)
-        self.res2 = ResidualBlock(num_channels)
-        self.res3 = ResidualBlock(num_channels)
-        self.res4 = ResidualBlock(num_channels)
-        
-        # Policy Head
-        self.prob_conv = nn.Conv3d(num_channels, 32, 1) # Reduce channels
-        self.prob_bn = nn.BatchNorm3d(32)
-        self.prob_fc = nn.Linear(32 * board_layers * board_size * board_size, 
-                                 board_layers * board_size * board_size)
-        
-        # Value Head
-        self.val_conv = nn.Conv3d(num_channels, 32, 1)
-        self.val_bn = nn.BatchNorm3d(32)
-        self.val_fc1 = nn.Linear(32 * board_layers * board_size * board_size, 64)
-        self.val_fc2 = nn.Linear(64, 1)
-        
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, s):
-        # s: (batch, 8, 5, 5) -> needs to be (batch, 1, 8, 5, 5) for Conv3d
-        s = s.view(-1, 1, self.board_layers, self.board_size, self.board_size)
-        
-        x = F.relu(self.bn1(self.conv1(s)))
-        x = self.res1(x)
-        x = self.res2(x)
-        x = self.res3(x)
-        x = self.res4(x)
-        
-        # Policy
-        pi = F.relu(self.prob_bn(self.prob_conv(x)))
-        pi = pi.view(-1, 32 * self.board_layers * self.board_size * self.board_size)
-        pi = self.prob_fc(pi)
-        
-        # Value
-        v = F.relu(self.val_bn(self.val_conv(x)))
-        v = v.view(-1, 32 * self.board_layers * self.board_size * self.board_size)
-        v = F.relu(self.val_fc1(v))
-        v = self.dropout(v)
-        v = torch.tanh(self.val_fc2(v))
-        
-        return F.log_softmax(pi, dim=1), v
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv3d(channels, channels, 3, stride=1, padding=1)
+        super().__init__()
+        self.conv1 = nn.Conv3d(channels, channels, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm3d(channels)
-        self.conv2 = nn.Conv3d(channels, channels, 3, stride=1, padding=1)
+        self.conv2 = nn.Conv3d(channels, channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm3d(channels)
-        
+
     def forward(self, x):
         residual = x
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += residual
-        out = F.relu(out)
-        return out
+        return F.relu(out)
+
+
+class Connect4Net(nn.Module):
+    """
+    AlphaZero-style network for 3-D Connect Four (8×5×5).
+    Input : (batch, 8, 5, 5)
+    Output: log-policy (batch, 200),  value (batch, 1)
+    """
+
+    def __init__(self, board_layers=8, board_size=5,
+                 num_channels=128, num_res_blocks=4, dropout=0.3):
+        super().__init__()
+        self.board_layers = board_layers
+        self.board_size = board_size
+        action_size = board_layers * board_size * board_size
+        flat_feat = 32 * board_layers * board_size * board_size
+
+        # Stem
+        self.conv1 = nn.Conv3d(1, num_channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm3d(num_channels)
+
+        # Residual tower
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(num_channels) for _ in range(num_res_blocks)]
+        )
+
+        # Policy head
+        self.pi_conv = nn.Conv3d(num_channels, 32, 1, bias=False)
+        self.pi_bn = nn.BatchNorm3d(32)
+        self.pi_fc = nn.Linear(flat_feat, action_size)
+
+        # Value head
+        self.v_conv = nn.Conv3d(num_channels, 32, 1, bias=False)
+        self.v_bn = nn.BatchNorm3d(32)
+        self.v_fc1 = nn.Linear(flat_feat, 64)
+        self.v_fc2 = nn.Linear(64, 1)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, s):
+        # s: (batch, 8, 5, 5) → (batch, 1, 8, 5, 5)
+        s = s.view(-1, 1, self.board_layers, self.board_size, self.board_size)
+
+        x = F.relu(self.bn1(self.conv1(s)))
+        x = self.res_blocks(x)
+
+        # Policy
+        pi = F.relu(self.pi_bn(self.pi_conv(x)))
+        pi = pi.view(pi.size(0), -1)
+        pi = self.pi_fc(pi)
+
+        # Value
+        v = F.relu(self.v_bn(self.v_conv(x)))
+        v = v.view(v.size(0), -1)
+        v = F.relu(self.v_fc1(v))
+        v = self.dropout(v)
+        v = torch.tanh(self.v_fc2(v))
+
+        return F.log_softmax(pi, dim=1), v

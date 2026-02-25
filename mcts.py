@@ -2,122 +2,126 @@ import math
 import numpy as np
 import torch
 
+
 class MCTS:
-    def __init__(self, game, model, args):
+    """
+    Monte-Carlo Tree Search with neural-network leaf evaluation.
+    The model may reside on any device (GPU / CPU); tensors are moved
+    accordingly and results are brought back to CPU / numpy for the tree.
+    """
+
+    def __init__(self, game, model, args, device='cpu'):
         self.game = game
         self.model = model
         self.args = args
-        self.Qsa = {}  # Stores Q values for s,a
-        self.Nsa = {}  # Stores times edge s,a was visited
-        self.Ns = {}   # Stores times board s was visited
-        self.Ps = {}   # Stores initial policy (returned by neural net)
-        self.Es = {}   # Stores game ended for board s
-        self.Vs = {}   # Stores valid moves for board s
+        self.device = device
+        self.Qsa = {}   # Q(s, a)
+        self.Nsa = {}   # N(s, a)
+        self.Ns = {}    # N(s)
+        self.Ps = {}    # P(s, ·) from the network
+        self.Es = {}    # game-ended cache
+        self.Vs = {}    # valid-moves cache
 
     def get_action_prob(self, canonical_board, temp=1):
-        """
-        Runs simulations and returns probabilities.
-        """
-        # --- Add Dirichlet Noise to the root node for exploration ---
         s = self.game.string_representation(canonical_board)
-        
-        # Ensure the root node is expanded so we have Ps[s]
+
+        # Ensure root is expanded
         if s not in self.Ps:
-            self.search(canonical_board)
-            
-        # Add noise to Ps[s]
-        if temp > 0: # Only add noise during self-play (training)
-            # AlphaZero parameters: epsilon=0.25, dirichlet_alpha=0.3 for Go
-            # For 3D Connect 4, action space is 200, so 0.3-0.5 is fine.
-            epsilon = 0.25
-            alpha = 0.5
-            
-            valid_moves = self.Vs[s]
-            noise = np.random.dirichlet([alpha] * int(np.sum(valid_moves)))
-            
-            # Weighted average of policy and noise
+            self._search(canonical_board)
+
+        # Dirichlet noise at the root (training only)
+        if temp > 0:
+            eps, alpha = 0.25, 0.5
+            valids = self.Vs[s]
+            num_valid = int(np.sum(valids))
+            noise = np.random.dirichlet([alpha] * num_valid)
             idx = 0
             for a in range(self.game.get_action_size()):
-                if valid_moves[a]:
-                    self.Ps[s][a] = (1 - epsilon) * self.Ps[s][a] + epsilon * noise[idx]
+                if valids[a]:
+                    self.Ps[s][a] = (1 - eps) * self.Ps[s][a] + eps * noise[idx]
                     idx += 1
 
         for _ in range(self.args.num_mcts_sims):
-            self.search(canonical_board)
+            self._search(canonical_board)
 
-        counts = [self.Nsa.get((s, a), 0) for a in range(self.game.get_action_size())]
+        counts = np.array([self.Nsa.get((s, a), 0)
+                           for a in range(self.game.get_action_size())],
+                          dtype=np.float64)
 
         if temp == 0:
-            best_as = np.array(np.argwhere(counts == np.max(counts))).flatten()
-            best_a = np.random.choice(best_as)
-            probs = [0] * len(counts)
-            probs[best_a] = 1
-            return probs
+            best = np.flatnonzero(counts == counts.max())
+            probs = np.zeros_like(counts)
+            probs[np.random.choice(best)] = 1.0
+            return probs.tolist()
 
-        counts = [x ** (1. / temp) for x in counts]
-        counts_sum = float(sum(counts))
-        probs = [x / counts_sum for x in counts]
+        counts = counts ** (1.0 / temp)
+        total = counts.sum()
+        probs = (counts / total).tolist() if total > 0 else counts.tolist()
         return probs
 
-    def search(self, canonical_board):
+    # ------------------------------------------------------------------ #
+
+    def _search(self, canonical_board):
         s = self.game.string_representation(canonical_board)
 
+        # Terminal?
         if s not in self.Es:
             self.Es[s] = self.game.get_game_ended(canonical_board, 1)
         if self.Es[s] != 0:
             return -self.Es[s]
 
+        # Leaf → expand with NN (GPU-aware)
         if s not in self.Ps:
-            # Leaf node
-            board_tensor = torch.FloatTensor(canonical_board.astype(np.float64))
-            # If utilizing GPU, move tensor here. We are on CPU.
+            board_t = torch.tensor(
+                canonical_board, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
             self.model.eval()
             with torch.no_grad():
-                pi, v = self.model(board_tensor.unsqueeze(0))
-            
-            self.Ps[s] = torch.exp(pi).data.cpu().numpy()[0]
-            v = v.data.cpu().numpy()[0][0]
-            
-            valid_moves = self.game.get_valid_moves(canonical_board)
-            self.Ps[s] = self.Ps[s] * valid_moves
-            sum_Ps_s = np.sum(self.Ps[s])
-            
-            if sum_Ps_s > 0:
-                self.Ps[s] /= sum_Ps_s
-            else:
-                # If all valid moves were masked likely due to logic error or extremely rare case
-                # Uniform distribution over valid moves
-                self.Ps[s] = self.Ps[s] + valid_moves
-                self.Ps[s] /= np.sum(self.Ps[s])
+                log_pi, v = self.model(board_t)
+            pi = torch.exp(log_pi).cpu().numpy()[0]
+            v = v.cpu().item()
 
-            self.Vs[s] = valid_moves
+            valids = self.game.get_valid_moves(canonical_board)
+            pi *= valids
+            s_pi = pi.sum()
+            if s_pi > 0:
+                pi /= s_pi
+            else:
+                pi = valids.astype(np.float32)
+                pi /= pi.sum()
+
+            self.Ps[s] = pi
+            self.Vs[s] = valids
             self.Ns[s] = 0
             return -v
 
-        valid_moves = self.Vs[s]
-        cur_best = -float('inf')
-        best_act = -1
+        # Selection (PUCT)
+        valids = self.Vs[s]
+        best_u = -float('inf')
+        best_a = -1
+        sqrt_ns = math.sqrt(self.Ns[s] + 1e-8)
 
-        # Pick the action with the highest upper confidence bound
         for a in range(self.game.get_action_size()):
-            if valid_moves[a]:
+            if valids[a]:
                 if (s, a) in self.Qsa:
-                    u = self.Qsa[(s, a)] + self.args.cpuct * self.Ps[s][a] * math.sqrt(self.Ns[s]) / (1 + self.Nsa[(s, a)])
+                    u = (self.Qsa[(s, a)]
+                         + self.args.cpuct * self.Ps[s][a] * sqrt_ns
+                         / (1 + self.Nsa[(s, a)]))
                 else:
-                    u = self.args.cpuct * self.Ps[s][a] * math.sqrt(self.Ns[s] + 1e-8)
+                    u = self.args.cpuct * self.Ps[s][a] * sqrt_ns
+                if u > best_u:
+                    best_u = u
+                    best_a = a
 
-                if u > cur_best:
-                    cur_best = u
-                    best_act = a
+        a = best_a
+        next_board, next_player = self.game.get_next_state(canonical_board, 1, a)
+        next_board = self.game.get_canonical_form(next_board, next_player)
 
-        a = best_act
-        next_s, next_player = self.game.get_next_state(canonical_board, 1, a)
-        next_s = self.game.get_canonical_form(next_s, next_player)
-
-        v = self.search(next_s)
+        v = self._search(next_board)
 
         if (s, a) in self.Qsa:
-            self.Qsa[(s, a)] = (self.Nsa[(s, a)] * self.Qsa[(s, a)] + v) / (self.Nsa[(s, a)] + 1)
+            self.Qsa[(s, a)] = ((self.Nsa[(s, a)] * self.Qsa[(s, a)] + v)
+                                / (self.Nsa[(s, a)] + 1))
             self.Nsa[(s, a)] += 1
         else:
             self.Qsa[(s, a)] = v

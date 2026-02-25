@@ -1,78 +1,63 @@
 import sys
+import os
 import torch
+import numpy as np
 import multiprocessing
+
 from trainer import Trainer, TrainerArgs
 
-# Protect entry point for multiprocessing
 if __name__ == "__main__":
-    # Ensure standard python multiprocessing behavior
+    # Use 'spawn' to avoid CUDA context issues in child processes
+    multiprocessing.set_start_method('spawn', force=True)
     multiprocessing.freeze_support()
-    
-    # Define Args
+
     args = TrainerArgs()
-    
-    # --- Custom Configuration ---
-    args.num_iterations = 10      # Adjust based on how long you want to run
-    args.num_self_play_games = 100 # Increase this if using parallel to get better data
+
+    # --- Training hyper-parameters ---
+    args.num_iterations = 10
+    args.num_self_play_games = 100
     args.checkpoint_interval = 2
     args.epochs = 5
-    args.max_checkpoints = 3      # Keep only 3 latest checkpoints to save space
-    args.eval_games = 10          # Games to play during evaluation
-    args.update_threshold = 0.55  # Required win rate to become the new 'best' model
-    args.cooldown_minutes = 8     # Hardware protection: stop for N minutes after each iteration
+    args.max_checkpoints = 3
+    args.eval_games = 10
+    args.update_threshold = 0.55
+    args.cooldown_minutes = 8
 
-    
-    # --- Resume Training Configuration ---
-    # Set this to True to resume from the latest checkpoint automatically
-    RESUME_TRAINING = True 
-    
-    # Path to a specific checkpoint if you want to load a specific one (e.g., './checkpoints/checkpoint_15/checkpoint.pth.tar')
-    # If None and RESUME_TRAINING is True, it will look for './checkpoints/latest.pth.tar'
+    # --- Resume configuration ---
+    RESUME_TRAINING = True
     CUSTOM_RESUME_PATH = None
-    # CUSTOM_RESUME_PATH = "D:\\四字棋3D\\connect4_3d_ai_train\\AI_v2.1.2\\checkpoints\\best.pth.tar"
-    
+
     resume_checkpoint = None
     if RESUME_TRAINING:
-        import os
         latest_path = os.path.join(args.checkpoint_dir, 'latest.pth.tar')
         if CUSTOM_RESUME_PATH and os.path.exists(CUSTOM_RESUME_PATH):
             resume_checkpoint = CUSTOM_RESUME_PATH
         elif os.path.exists(latest_path):
             resume_checkpoint = latest_path
-        
+
         if resume_checkpoint:
-            print(f"Resume Training requested. Using checkpoint: {resume_checkpoint}")
+            print(f"Resuming from checkpoint: {resume_checkpoint}")
         else:
-            print("Resume Training requested but no checkpoint found. Starting from scratch.")
-    
-    # --- Check Iterations ---
-    if RESUME_TRAINING and resume_checkpoint:
-        # Simple check: if start_iter (from checkpoint) >= num_iterations, warn user
-        import numpy as np
+            print("No checkpoint found – starting from scratch.")
+
+    # --- Adjust num_iterations if checkpoint already past it ---
+    if resume_checkpoint:
         try:
-            with torch.serialization.safe_globals([np._core.multiarray._reconstruct]):
-                checkpoint_data = torch.load(resume_checkpoint, map_location='cpu')
+            ckpt = torch.load(resume_checkpoint, map_location='cpu',
+                              weights_only=False)
         except Exception:
-            # 备用路径（不同 numpy 版本）
-            try:
-                with torch.serialization.safe_globals([np.core.multiarray._reconstruct]):
-                    checkpoint_data = torch.load(resume_checkpoint, map_location='cpu')
-            except Exception as e:
-                print("警告：safe_globals 两次尝试均失败；仅在信任 checkpoint 时使用 weights_only=False")
-                checkpoint_data = torch.load(resume_checkpoint, map_location='cpu', weights_only=False) 
-        
-        # checkpoint_data = torch.load(resume_checkpoint, map_location='cpu')
-
-        if isinstance(checkpoint_data, dict) and 'iteration' in checkpoint_data:
-            last_iter = checkpoint_data['iteration']
+            ckpt = {}
+        if isinstance(ckpt, dict) and 'iteration' in ckpt:
+            last_iter = ckpt['iteration']
             if last_iter >= args.num_iterations:
-                print(f"WARNING: Checkpoint is at iteration {last_iter}, but num_iterations is set to {args.num_iterations}.")
-                print(f"Increasing num_iterations to {last_iter + 10} to continue training.")
+                print(f"Checkpoint at iter {last_iter} >= "
+                      f"num_iterations {args.num_iterations}. "
+                      f"Extending to {last_iter + 10}.")
                 args.num_iterations = last_iter + 10
-        del checkpoint_data # Free memory
+        del ckpt
 
-    print("Initializing Training...")
+    print("Initializing Trainer …")
     trainer = Trainer(args, resume_path=resume_checkpoint)
-    
-    print("Starting Training Loop...")
+
+    print("Starting Training Loop …")
     trainer.train()
