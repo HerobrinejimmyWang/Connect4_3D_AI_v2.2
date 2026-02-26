@@ -1,5 +1,7 @@
 import sys
 import torch
+import numpy as np
+import random
 import multiprocessing
 from trainer import Trainer, TrainerArgs
 
@@ -7,6 +9,14 @@ from trainer import Trainer, TrainerArgs
 if __name__ == "__main__":
     # Ensure standard python multiprocessing behavior
     multiprocessing.freeze_support()
+
+    # --- Global random seed for reproducibility ---
+    GLOBAL_SEED = 42
+    random.seed(GLOBAL_SEED)
+    np.random.seed(GLOBAL_SEED)
+    torch.manual_seed(GLOBAL_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(GLOBAL_SEED)
     
     # Define Args
     args = TrainerArgs()

@@ -1,6 +1,24 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def board_to_channels(board):
+    """
+    Convert a canonical board of shape (8, 5, 5) with values 1/0/-1
+    to a 2-channel float32 array of shape (2, 8, 5, 5).
+      channel 0: current player's pieces (board > 0)
+      channel 1: opponent's pieces       (board < 0)
+    """
+    ch0 = (board > 0).astype(np.float32)
+    ch1 = (board < 0).astype(np.float32)
+    return np.stack([ch0, ch1], axis=0)
+
+
+# Number of input channels fed to Connect4Net (current player + opponent)
+NUM_INPUT_CHANNELS = 2
+
 
 class Connect4Net(nn.Module):
     def __init__(self, board_layers=8, board_size=5, num_channels=128, dropout=0.3):
@@ -8,8 +26,8 @@ class Connect4Net(nn.Module):
         self.board_layers = board_layers
         self.board_size = board_size
         
-        # Input: 1 channel (board state), Output: num_channels
-        self.conv1 = nn.Conv3d(1, num_channels, 3, stride=1, padding=1)
+        # Input: 2 channels (current player + opponent), Output: num_channels
+        self.conv1 = nn.Conv3d(NUM_INPUT_CHANNELS, num_channels, 3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm3d(num_channels)
         
         # Residual Blocks
@@ -33,8 +51,8 @@ class Connect4Net(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, s):
-        # s: (batch, 8, 5, 5) -> needs to be (batch, 1, 8, 5, 5) for Conv3d
-        s = s.view(-1, 1, self.board_layers, self.board_size, self.board_size)
+        # s: (batch, 2, 8, 5, 5) for Conv3d (2 channels: current player + opponent)
+        s = s.view(-1, NUM_INPUT_CHANNELS, self.board_layers, self.board_size, self.board_size)
         
         x = F.relu(self.bn1(self.conv1(s)))
         x = self.res1(x)
