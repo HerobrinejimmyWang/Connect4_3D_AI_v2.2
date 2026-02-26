@@ -15,11 +15,30 @@ from collections import deque
 from random import shuffle
 
 from game_rules import GameRules
-from model import Connect4Net
+from model import Connect4Net, board_to_channels, NUM_INPUT_CHANNELS
 from mcts import MCTS
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class Connect4Dataset(torch.utils.data.Dataset):
+    """Dataset wrapping training examples for use with DataLoader."""
+    def __init__(self, examples):
+        boards, pis, vs = zip(*examples)
+        self.boards = [np.array(b) for b in boards]
+        self.pis = np.array(pis, dtype=np.float32)
+        self.vs = np.array(vs, dtype=np.float32)
+
+    def __len__(self):
+        return len(self.vs)
+
+    def __getitem__(self, idx):
+        return (
+            torch.FloatTensor(board_to_channels(self.boards[idx])),
+            torch.FloatTensor(self.pis[idx]),
+            torch.FloatTensor([self.vs[idx]]),
+        )
+
 
 class TrainerArgs:
     def __init__(self):
@@ -33,14 +52,16 @@ class TrainerArgs:
         self.learning_rate = 0.001
         self.weight_decay = 1e-4      # L2 Regularization
         self.temp_threshold = 15      # Temperature threshold for exploration
-        self.history_len = 3          # Number of iterations to keep history
-        self.min_game_steps = 10      # Filter games shorter than this
-        self.latest_data_weight = 1.3  # Weight for the latest iteration's data
-        self.checkpoint_interval = 5  # Checkpoint every X iterations
-        self.max_checkpoints = 3      # Number of old checkpoints to keep (excluding best/latest)
-        self.update_threshold = 0.55  # Win rate required to replace the 'best' model
-        self.eval_games = 10          # Number of games to play during evaluation
-        self.cooldown_minutes = 5     # Cooldown time after each iteration (minutes)
+        self.history_len = 20             # Number of iterations to keep history
+        self.min_game_steps = 10          # Filter games shorter than this
+        self.latest_data_weight = 2.0     # Weight for the latest iteration's data (2x oversampling)
+        self.checkpoint_interval = 5      # Checkpoint every X iterations
+        self.max_checkpoints = 3          # Number of old checkpoints to keep (excluding best/latest)
+        self.update_threshold = 0.55      # Win rate required to replace the 'best' model
+        self.eval_games = 10              # Number of games to play during evaluation
+        self.cooldown_minutes = 5         # Cooldown time after each iteration (minutes)
+        self.train_device = 'cpu'         # Device used for training (e.g. 'cpu', 'cuda:0')
+        self.infer_device = 'cpu'         # Device used for inference / self-play workers
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith('__')}
@@ -62,6 +83,7 @@ def self_play_worker(args_tuple):
     game = GameRules()
     net = Connect4Net()
     net.load_state_dict(model_state)
+    net.to(args.infer_device)
     net.eval() # Set to eval mode for inference
     
     mcts = MCTS(game, net, args)
@@ -108,7 +130,7 @@ class Trainer:
     def __init__(self, args, resume_path=None):
         self.args = args
         self.game = GameRules()
-        self.nnet = Connect4Net()
+        self.nnet = Connect4Net().to(args.train_device)
         self.optimizer = optim.Adam(self.nnet.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         # Learning rate scheduler: reduce LR by 0.5 every 50 iterations
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.5)
@@ -122,7 +144,7 @@ class Trainer:
         self.best_win_rate = -1.0 # Track best performance
         
         # Best model for pitting
-        self.best_nnet = Connect4Net()
+        self.best_nnet = Connect4Net().to(args.train_device)
         self.best_nnet.load_state_dict(self.nnet.state_dict()) # Initial best is current
         
         # Resume functionality
@@ -154,7 +176,8 @@ class Trainer:
         """
         try:
             self.nnet.eval()
-            dummy_input = torch.randn(1, 8, 5, 5) # Matches Connect4Net expected input
+            device = next(self.nnet.parameters()).device
+            dummy_input = torch.randn(1, NUM_INPUT_CHANNELS, 8, 5, 5).to(device)
             with torch.no_grad():
                 pi, v = self.nnet(dummy_input)
             return True
@@ -243,7 +266,8 @@ class Trainer:
         num_workers = max(1, int(cpu_count * 0.6))
         logging.info(f"Spawning {num_workers} workers for self-play...")
         
-        model_state = self.nnet.state_dict()
+        # Send CPU state dict to workers (handles GPU->CPU transfer if needed)
+        model_state = {k: v.cpu() for k, v in self.nnet.state_dict().items()}
         
         # Prepare arguments for each game
         # We need unique seeds for randomness
@@ -323,39 +347,40 @@ class Trainer:
 
     def train_network(self, examples):
         """
+        Train the network on examples using DataLoader for proper epoch-based sampling.
         examples: list of (board, policy, value)
         """
         self.nnet.train()
-        batch_count = int(len(examples) / self.args.batch_size)
-        
-        pbar = tqdm(range(batch_count), desc="Training Net")
-        total_loss = 0
-        
-        for _ in pbar:
-            sample_ids = np.random.randint(len(examples), size=self.args.batch_size)
-            boards, pis, vs = list(zip(*[examples[i] for i in sample_ids]))
-            
-            boards = torch.FloatTensor(np.array(boards).astype(np.float64))
-            target_pis = torch.FloatTensor(np.array(pis))
-            target_vs = torch.FloatTensor(np.array(vs).astype(np.float64))
-            
-            # Predict
-            out_pi, out_v = self.nnet(boards)
-            
-            # Loss: value_loss + policy_loss
-            # value loss = mean squared error
-            # policy loss = cross entropy (log_softmax output already)
-            l_v = F.mse_loss(out_v.view(-1), target_vs.view(-1))
-            l_pi = -torch.sum(target_pis * out_pi) / target_pis.size(0)
-            
-            total_l = l_v + l_pi
-            
-            self.optimizer.zero_grad()
-            total_l.backward()
-            self.optimizer.step()
-            
-            total_loss += total_l.item()
-            pbar.set_postfix(loss=total_loss/(_ + 1))
+        device = next(self.nnet.parameters()).device
+        dataset = Connect4Dataset(examples)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=self.args.batch_size, shuffle=True
+        )
+
+        for epoch in range(self.args.epochs):
+            total_loss = 0.0
+            pbar = tqdm(loader, desc=f"Training Epoch {epoch + 1}/{self.args.epochs}")
+            for batch_idx, (boards, target_pis, target_vs) in enumerate(pbar):
+                boards = boards.to(device)
+                target_pis = target_pis.to(device)
+                target_vs = target_vs.to(device)
+
+                out_pi, out_v = self.nnet(boards)
+
+                # Value loss: mean squared error
+                l_v = F.mse_loss(out_v.view(-1), target_vs.view(-1))
+                # Policy loss: cross-entropy (out_pi is log_softmax output)
+                l_pi = -(target_pis * out_pi).sum(dim=1).mean()
+
+                total_l = l_v + l_pi
+
+                self.optimizer.zero_grad()
+                total_l.backward()
+                torch.nn.utils.clip_grad_norm_(self.nnet.parameters(), max_norm=5.0)
+                self.optimizer.step()
+
+                total_loss += total_l.item()
+                pbar.set_postfix(loss=total_loss / (batch_idx + 1))
 
     def save_checkpoint(self, iteration):
         """
@@ -378,9 +403,6 @@ class Trainer:
             'state_dict': self.nnet.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'train_examples_history': self.train_examples_history,
-            'eval_history': self.eval_history,
-            'best_win_rate': self.best_win_rate,
-            'args': self.args.to_dict() # Save hyperparameters
         }
 
         # Save full state

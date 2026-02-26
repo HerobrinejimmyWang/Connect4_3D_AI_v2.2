@@ -2,6 +2,8 @@ import math
 import numpy as np
 import torch
 
+from model import board_to_channels
+
 class MCTS:
     def __init__(self, game, model, args):
         self.game = game
@@ -69,11 +71,11 @@ class MCTS:
 
         if s not in self.Ps:
             # Leaf node
-            board_tensor = torch.FloatTensor(canonical_board.astype(np.float64))
-            # If utilizing GPU, move tensor here. We are on CPU.
+            board_tensor = torch.FloatTensor(board_to_channels(canonical_board))
+            device = next(self.model.parameters()).device
             self.model.eval()
             with torch.no_grad():
-                pi, v = self.model(board_tensor.unsqueeze(0))
+                pi, v = self.model(board_tensor.unsqueeze(0).to(device))
             
             self.Ps[s] = torch.exp(pi).data.cpu().numpy()[0]
             v = v.data.cpu().numpy()[0][0]
