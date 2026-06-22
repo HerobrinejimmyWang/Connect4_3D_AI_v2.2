@@ -1,3 +1,4 @@
+import logging
 import re
 import queue
 import time
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 import torch.multiprocessing as mp
 
 from model import Connect4Net, board_to_channels
+from mcts import _inference_autocast, _validate_inference_precision
 
 
 class LegacyResidualBlock(nn.Module):
@@ -203,6 +205,20 @@ def encode_board_for_model(board, config):
     return board_to_channels(adapted).astype(np.float32)
 
 
+def encode_board_batch_for_model(boards, config):
+    raw = np.stack(boards, axis=0).astype(np.int8, copy=False)
+    board_layers = int(config["board_layers"])
+    board_size = int(config["board_size"])
+    adapted = np.zeros((raw.shape[0], board_layers, board_size, board_size), dtype=np.int8)
+    copy_layers = min(raw.shape[1], board_layers)
+    copy_rows = min(raw.shape[2], board_size)
+    copy_cols = min(raw.shape[3], board_size)
+    adapted[:, :copy_layers, :copy_rows, :copy_cols] = raw[:, :copy_layers, :copy_rows, :copy_cols]
+    if int(config.get("input_channels", 2)) == 1:
+        return adapted[:, np.newaxis, ...].astype(np.float32)
+    return np.stack((adapted > 0, adapted < 0), axis=1).astype(np.float32, copy=False)
+
+
 class CompatibleModelPredictor:
     def __init__(self, model, config, action_size):
         self.model = model
@@ -211,12 +227,9 @@ class CompatibleModelPredictor:
         self.device = next(self.model.parameters()).device
 
     def predict(self, batch_states):
-        encoded = np.stack(
-            [encode_board_for_model(board, self.config) for board in batch_states],
-            axis=0,
-        ).astype(np.float32)
+        encoded = encode_board_batch_for_model(batch_states, self.config)
         tensor = torch.from_numpy(encoded).to(self.device)
-        with torch.no_grad():
+        with torch.inference_mode():
             log_pi, value = self.model(tensor)
         policy = torch.exp(log_pi).cpu().numpy().astype(np.float32, copy=False)
         policy = np.asarray([self._crop_and_normalize(row) for row in policy], dtype=np.float32)
@@ -242,63 +255,98 @@ def run_compatible_inference_server(
     device,
     batch_size,
     batch_timeout_s,
+    inference_precision="fp32",
+    stats_queue=None,
 ):
     model = build_model_from_state_dict(model_state, model_config, device=device)
 
     if isinstance(device, str) and device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
 
-    while True:
-        if stop_event.is_set() and request_queue.empty():
-            break
-
-        batch = []
-        try:
-            first_req = request_queue.get(timeout=batch_timeout_s)
-            batch.append(first_req)
-        except queue.Empty:
-            continue
-
-        start = time.perf_counter()
-        while len(batch) < batch_size:
-            elapsed = time.perf_counter() - start
-            if elapsed >= batch_timeout_s:
-                break
+    request_count = 0
+    batch_count = 0
+    max_observed_batch = 0
+    timeout_flushes = 0
+    inference_time_s = 0.0
+    try:
+        shutdown_requested = False
+        while not shutdown_requested:
+            batch = []
             try:
-                timeout_left = max(0.0, batch_timeout_s - elapsed)
-                batch.append(request_queue.get(timeout=timeout_left))
+                first_req = request_queue.get(timeout=batch_timeout_s)
+                if first_req is None:
+                    break
+                batch.append(first_req)
             except queue.Empty:
-                break
+                continue
 
-        states = np.stack(
-            [encode_board_for_model(req[2], model_config) for req in batch],
-            axis=0,
-        ).astype(np.float32)
-        tensor = torch.from_numpy(states).to(device, non_blocking=True)
+            start = time.perf_counter()
+            while len(batch) < batch_size:
+                elapsed = time.perf_counter() - start
+                if elapsed >= batch_timeout_s:
+                    break
+                try:
+                    timeout_left = max(0.0, batch_timeout_s - elapsed)
+                    request = request_queue.get(timeout=timeout_left)
+                    if request is None:
+                        shutdown_requested = True
+                        break
+                    batch.append(request)
+                except queue.Empty:
+                    break
 
-        with torch.no_grad():
-            log_pi, value = model(tensor)
+            if len(batch) < batch_size:
+                timeout_flushes += 1
+            request_count += len(batch)
+            batch_count += 1
+            max_observed_batch = max(max_observed_batch, len(batch))
+            states = encode_board_batch_for_model([req[2] for req in batch], model_config)
+            tensor = torch.from_numpy(states).to(device)
 
-        policies = torch.exp(log_pi).cpu().numpy().astype(np.float32, copy=False)
-        values = value.squeeze(1).cpu().numpy().astype(np.float32, copy=False)
+            inference_start = time.perf_counter()
+            with torch.inference_mode():
+                with _inference_autocast(device, inference_precision):
+                    log_pi, value = model(tensor)
+            inference_time_s += time.perf_counter() - inference_start
 
-        for idx, (worker_id, request_id, _) in enumerate(batch):
-            cropped = np.asarray(policies[idx][: int(action_size)], dtype=np.float32)
-            cropped = np.clip(cropped, 0.0, None)
-            total = float(np.sum(cropped))
-            if not np.isfinite(total) or total <= 0.0:
-                cropped = np.full(int(action_size), 1.0 / int(action_size), dtype=np.float32)
-            else:
-                cropped = cropped / total
-            worker_response_conns[int(worker_id)].send(
-                (int(request_id), cropped, float(values[idx]))
+            policies = torch.exp(log_pi.float()).cpu().numpy().astype(np.float32, copy=False)
+            values = value.float().squeeze(1).cpu().numpy().astype(np.float32, copy=False)
+
+            for idx, (worker_id, request_id, _) in enumerate(batch):
+                cropped = np.asarray(policies[idx][: int(action_size)], dtype=np.float32)
+                cropped = np.clip(cropped, 0.0, None)
+                total = float(np.sum(cropped))
+                if not np.isfinite(total) or total <= 0.0:
+                    cropped = np.full(int(action_size), 1.0 / int(action_size), dtype=np.float32)
+                else:
+                    cropped = cropped / total
+                worker_response_conns[int(worker_id)].send(
+                    (int(request_id), cropped, float(values[idx]))
+                )
+    finally:
+        if stats_queue is not None:
+            stats_queue.put(
+                {
+                    "requests": int(request_count),
+                    "batches": int(batch_count),
+                    "average_batch_size": float(request_count / max(1, batch_count)),
+                    "max_batch_size": int(max_observed_batch),
+                    "batch_capacity": int(batch_size),
+                    "batch_fill_ratio": float(request_count / max(1, batch_count * batch_size)),
+                    "timeout_flushes": int(timeout_flushes),
+                    "inference_time_s": float(inference_time_s),
+                    "precision": str(inference_precision),
+                }
             )
-
-    for conn in worker_response_conns.values():
-        try:
-            conn.close()
-        except Exception:
-            pass
+            stats_queue.close()
+            stats_queue.join_thread()
+        for conn in worker_response_conns.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        request_queue.close()
+        request_queue.join_thread()
 
 
 class CompatibleGlobalInferenceServer:
@@ -311,9 +359,13 @@ class CompatibleGlobalInferenceServer:
         device="cuda",
         batch_size=32,
         batch_timeout_s=0.003,
+        inference_precision="fp32",
     ):
+        inference_precision = _validate_inference_precision(device, inference_precision)
         self.request_queue = mp.Queue()
         self.stop_event = mp.Event()
+        self.stats_queue = mp.Queue(maxsize=1)
+        self.last_stats = {}
         self.process = mp.Process(
             target=run_compatible_inference_server,
             args=(
@@ -326,6 +378,8 @@ class CompatibleGlobalInferenceServer:
                 device,
                 max(1, int(batch_size)),
                 float(batch_timeout_s),
+                str(inference_precision),
+                self.stats_queue,
             ),
         )
 
@@ -334,9 +388,19 @@ class CompatibleGlobalInferenceServer:
 
     def close(self):
         self.stop_event.set()
+        self.request_queue.put(None)
         self.process.join(timeout=5.0)
         if self.process.is_alive():
             self.process.terminate()
             self.process.join(timeout=2.0)
+        try:
+            self.last_stats = self.stats_queue.get(timeout=1.0)
+        except queue.Empty:
+            self.last_stats = {}
+        if self.last_stats:
+            logging.info("Compatible inference server stats: %s", self.last_stats)
         self.request_queue.close()
         self.request_queue.join_thread()
+        self.stats_queue.close()
+        self.stats_queue.join_thread()
+        return dict(self.last_stats)

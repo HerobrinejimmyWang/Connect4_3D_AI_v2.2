@@ -1,0 +1,10 @@
+*.pyc
+
+*.pth
+*.tar
+arena/history/*
+test/history/*
+*/checkpoints/*
+*.log
+
+迭代性能记录.xlsx

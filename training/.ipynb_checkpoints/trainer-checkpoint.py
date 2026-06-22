@@ -3,7 +3,6 @@ import sys
 import time
 import shutil
 import logging
-import json
 from datetime import datetime
 import torch
 import torch.nn.functional as F
@@ -12,12 +11,11 @@ import numpy as np
 import multiprocessing
 import gc
 import copy
-from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from collections import deque
 
 from game_rules import GameRules
-from model import Connect4Net, board_to_channels, NUM_INPUT_CHANNELS, extract_model_config
+from model import Connect4Net, board_to_channels, NUM_INPUT_CHANNELS
 from parallel_games import execute_evaluation_parallel, execute_self_play_parallel
 from teacher_data import (
     build_history_entry,
@@ -89,7 +87,7 @@ class TrainerArgs:
         self.epochs = 10              # Training epochs per iteration
         self.checkpoint_dir = './checkpoints'
         self.learning_rate = 0.001
-        self.weight_decay = 1e-4      # L2 Regularization
+        self.weight_decay = 2e-4      # L2 Regularization
         self.self_play_exploration_strength = 1.0
         self.self_play_phase_schedule = [
             {
@@ -122,22 +120,14 @@ class TrainerArgs:
         self.history_len = 20             # Number of iterations to keep history
         self.min_game_steps = 8          # Filter games shorter than this
         self.min_game_steps_start_iteration = 11  # Enable short-game filtering from iteration 11 onward
-        self.latest_data_weight = 1.0     # Disable latest-iteration oversampling temporarily
+        self.latest_data_weight = 2.0     # Weight for the latest iteration's data (2x oversampling)
         self.checkpoint_interval = 5      # Checkpoint every X iterations
         self.eval_interval = 5            # Evaluate every X iterations
         self.lr_decay_step_size = 50      # Reduce LR every X iterations
         self.lr_decay_gamma = 0.8         # LR decay factor
-        self.min_learning_rate = 0.0      # Optional lower bound for LR decay
         self.max_checkpoints = 3          # Number of old checkpoints to keep (excluding best/latest)
         self.update_threshold = 0.55      # Win rate required to replace the 'best' model
         self.eval_games = 10              # Number of games to play during evaluation
-        self.best_eval_games_per_generation = 30
-        self.best_eval_required_generations = 2
-        self.best_update_threshold = 0.55
-        self.best_eval_parallelize_generations = True
-        self.best_recent_filename = 'best_new.pth.tar'
-        self.best_older_filename = 'best_old.pth.tar'
-        self.best_legacy_filename = 'best.pth.tar'
         self.train_device = 'cuda' if has_cuda else 'cpu'  # Device used for training
         self.infer_device = 'cpu'         # Device used for self-play workers
         self.shared_inference_device = 'cuda' if has_cuda else 'cpu'
@@ -145,19 +135,14 @@ class TrainerArgs:
         self.self_play_cpu_ratio = 0.75   # Ratio of CPU cores used for self-play
         self.self_play_workers = min(4, cpu_count)
         self.max_self_play_workers = cpu_count
-        self.search_thread_budget = 0
-        self.shared_inference_server_count = 1
+        self.shared_inference_server_count = 2 if has_cuda else 1
         self.high_mcts_shared_inference_server_threshold = 1024
         self.high_mcts_shared_inference_server_count = self.shared_inference_server_count
         self.compatible_inference_server_count = 1
         self.num_mcts_threads = 8
         self.virtual_loss = 1.0
-        self.reuse_mcts_tree = True
-        self.persistent_mcts_threads = True
-        self.enable_mcts_search_stats = True
         self.inference_batch_size = 32
         self.inference_timeout_s = 0.003
-        self.inference_precision = 'fp32'
         self.enable_tf32 = has_cuda       # Allow TF32 on Ampere+ for faster matmul/convolution
         self.mcts_schedule = [
             (1, 20, 64),
@@ -211,8 +196,6 @@ class TrainerArgs:
         self.option_a_freeze_shared_prefixes = []
         self.value_loss_weight = 1.0
         self.policy_loss_weight = 1.0
-        self.policy_head_lr_scale = 1.0
-        self.value_head_lr_scale = 0.8
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith('__')}
@@ -233,7 +216,7 @@ class Trainer:
 
         self.game = GameRules()
         self.nnet = Connect4Net(num_channels=args.num_channels).to(args.train_device)
-        self.optimizer = self._build_optimizer_with_head_lr_scales()
+        self.optimizer = optim.Adam(self.nnet.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         # Learning rate scheduler: reduce LR every step_size iterations
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer, 
@@ -251,9 +234,6 @@ class Trainer:
         self.best_win_rate = -1.0 # Track best performance
         self.best_model_iteration = 0
         self.best_model_label = 'random_model'
-        self.older_best_win_rate = -1.0
-        self.older_best_model_iteration = 0
-        self.older_best_model_label = 'none'
         self.consecutive_no_improve_evals = 0
         self.iteration_loss_history = deque(maxlen=self.args.loss_increase_patience)
         self.stop_reason = None
@@ -269,7 +249,6 @@ class Trainer:
         
         # Best model for pitting
         self.best_nnet = None
-        self.older_best_nnet = None
         self.best_model_iteration = 0
         self.best_model_label = 'random_model'
         self.auxiliary_nnet = None
@@ -281,20 +260,38 @@ class Trainer:
         self.teacher_bootstrap_metadata = {}
         self.teacher_bootstrap_buffer_path = None
         self.latest_auxiliary_win_rate = None
-        self.last_self_play_game_results = []
-        self.teacher_logging_enabled = False
         
         # Resume functionality
         if resume_path:
             self.load_checkpoint(resume_path)
+            # After loading resume, try to load the best model as opponent
+            best_path = os.path.join(args.checkpoint_dir, 'best.pth.tar')
+            if os.path.exists(best_path):
+                logging.info(f"Loading previous best model for evaluation: {best_path}")
+                try:
+                    try:
+                        with torch.serialization.safe_globals([np._core.multiarray._reconstruct]):
+                            best_checkpoint = torch.load(best_path, map_location='cpu')
+                    except Exception:
+                        try:
+                            with torch.serialization.safe_globals([np.core.multiarray._reconstruct]):
+                                best_checkpoint = torch.load(best_path, map_location='cpu')
+                        except Exception:
+                            best_checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
+                    self.best_nnet = Connect4Net(num_channels=args.num_channels).to(args.train_device)
+                    self.best_nnet.load_state_dict(best_checkpoint['state_dict'])
+                    self.best_model_iteration = best_checkpoint.get('best_model_iteration', self.best_model_iteration)
+                    self.best_model_label = best_checkpoint.get('best_model_label', self.best_model_label)
+                    self.best_win_rate = best_checkpoint.get('best_win_rate', self.best_win_rate)
+                except Exception as e:
+                    logging.warning(f"Could not load best model for pitting: {e}")
+                    self.best_nnet = None
+                    self.best_model_label = 'random_model'
         else:
             logging.info("Starting training from scratch. Evaluation will be against random policy.")
 
-        self._load_best_generations_from_disk()
-
         self._load_auxiliary_model()
         self._initialize_teacher_bootstrap_buffer()
-        self.teacher_logging_enabled = self._is_teacher_pipeline_enabled()
 
         self._initialize_option_a_recovery_state()
 
@@ -335,35 +332,30 @@ class Trainer:
                 f"shared_inference_servers={int(getattr(self.args, 'shared_inference_server_count', 1))}, "
                 f"compatible_inference_servers={int(getattr(self.args, 'compatible_inference_server_count', 1))}"
             ),
-            f"self_play_exploration_strength={getattr(self.args, 'self_play_exploration_strength', 1.0):.3f}",
+            (
+                f"self_play_exploration_strength={getattr(self.args, 'self_play_exploration_strength', 1.0):.3f}, "
+                f"teacher_bootstrap_games={int(getattr(self.args, 'teacher_bootstrap_num_games', 0))}, "
+                f"teacher_warmup_iters={int(getattr(self.args, 'teacher_bootstrap_warmup_iterations', 0))}, "
+                f"teacher_replay_ratio={float(getattr(self.args, 'teacher_replay_initial_ratio', 0.0)):.3f}"
+            ),
             f"self_play_phase_schedule={self._format_phase_schedule()}",
             f"exploration_iteration_schedule={self._format_iteration_schedule(getattr(self.args, 'exploration_iteration_schedule', []), 'temperature_scale', 'noise_scale')}",
+            (
+                f"teacher_replay_schedule=initial={float(getattr(self.args, 'teacher_replay_initial_ratio', 0.0)):.3f}, "
+                f"final={float(getattr(self.args, 'teacher_replay_final_ratio', 0.0)):.3f}, "
+                f"decay_iters={int(getattr(self.args, 'teacher_replay_decay_iterations', 1))}, "
+                f"drift_threshold={float(getattr(self.args, 'teacher_replay_drift_threshold', 0.0)):.3f}, "
+                f"drift_ratio={float(getattr(self.args, 'teacher_replay_drift_ratio', 0.0)):.3f}, "
+                f"drift_relax={int(getattr(self.args, 'teacher_replay_relax_start_iteration', 0))}"
+                f"->{int(getattr(self.args, 'teacher_replay_relax_end_iteration', 0))}, "
+                f"relaxed_drift_ratio={float(getattr(self.args, 'teacher_replay_relaxed_drift_ratio', 0.0)):.3f}"
+            ),
         ])
-        if self.teacher_logging_enabled:
-            self._append_info_log(
-                (
-                    f"teacher_bootstrap_games={int(getattr(self.args, 'teacher_bootstrap_num_games', 0))}, "
-                    f"teacher_warmup_iters={int(getattr(self.args, 'teacher_bootstrap_warmup_iterations', 0))}, "
-                    f"teacher_replay_ratio={float(getattr(self.args, 'teacher_replay_initial_ratio', 0.0)):.3f}"
-                )
-            )
-            self._append_info_log(
-                (
-                    f"teacher_replay_schedule=initial={float(getattr(self.args, 'teacher_replay_initial_ratio', 0.0)):.3f}, "
-                    f"final={float(getattr(self.args, 'teacher_replay_final_ratio', 0.0)):.3f}, "
-                    f"decay_iters={int(getattr(self.args, 'teacher_replay_decay_iterations', 1))}, "
-                    f"drift_threshold={float(getattr(self.args, 'teacher_replay_drift_threshold', 0.0)):.3f}, "
-                    f"drift_ratio={float(getattr(self.args, 'teacher_replay_drift_ratio', 0.0)):.3f}, "
-                    f"drift_relax={int(getattr(self.args, 'teacher_replay_relax_start_iteration', 0))}"
-                    f"->{int(getattr(self.args, 'teacher_replay_relax_end_iteration', 0))}, "
-                    f"relaxed_drift_ratio={float(getattr(self.args, 'teacher_replay_relaxed_drift_ratio', 0.0)):.3f}"
-                )
-            )
-        if self.teacher_logging_enabled and self.auxiliary_nnet is not None:
+        if self.auxiliary_nnet is not None:
             self._append_info_log(
                 f"auxiliary_model={self.args.auxiliary_model_label} @ {self.args.auxiliary_model_path}"
             )
-        if self.teacher_logging_enabled and self.teacher_bootstrap_buffer_path:
+        if self.teacher_bootstrap_buffer_path:
             self._append_info_log(
                 f"teacher_bootstrap_buffer={self.teacher_bootstrap_buffer_path} | samples={len(self.teacher_bootstrap_examples)}"
             )
@@ -377,15 +369,14 @@ class Trainer:
                 f"low_temp=[{float(getattr(self.args, 'option_a_low_temp_min', 0.3)):.3f}, "
                 f"{float(getattr(self.args, 'option_a_low_temp_max', 0.5)):.3f}]"
             )
-        if self.teacher_logging_enabled:
-            teacher_budget = self._get_teacher_sample_budget()
-            if teacher_budget.get('estimated_total_teacher_samples_before_pure') is not None:
-                self._append_info_log(
-                    "teacher_sample_budget="
-                    f"warmup={teacher_budget.get('warmup_teacher_samples', 0)} | "
-                    f"replay_before_pure={teacher_budget.get('estimated_teacher_replay_samples_before_pure', 0)} | "
-                    f"total_before_pure={teacher_budget.get('estimated_total_teacher_samples_before_pure', 0)}"
-                )
+        teacher_budget = self._get_teacher_sample_budget()
+        if teacher_budget.get('estimated_total_teacher_samples_before_pure') is not None:
+            self._append_info_log(
+                "teacher_sample_budget="
+                f"warmup={teacher_budget.get('warmup_teacher_samples', 0)} | "
+                f"replay_before_pure={teacher_budget.get('estimated_teacher_replay_samples_before_pure', 0)} | "
+                f"total_before_pure={teacher_budget.get('estimated_total_teacher_samples_before_pure', 0)}"
+            )
 
     def _append_info_log(self, lines):
         if isinstance(lines, str):
@@ -405,92 +396,6 @@ class Trainer:
 
     def _get_learning_rate(self):
         return float(self.optimizer.param_groups[0]['lr'])
-
-    def _apply_min_learning_rate(self):
-        min_learning_rate = float(getattr(self.args, 'min_learning_rate', 0.0) or 0.0)
-        if min_learning_rate <= 0:
-            return False
-
-        any_clamped = False
-        for param_group in self.optimizer.param_groups:
-            group_scale = float(param_group.get('lr_scale', 1.0) or 1.0)
-            floor_lr = min_learning_rate * group_scale
-            current_lr = float(param_group['lr'])
-            if current_lr < floor_lr:
-                param_group['lr'] = floor_lr
-                any_clamped = True
-        return any_clamped
-
-    def _get_head_lr_scales(self):
-        policy_scale = float(getattr(self.args, 'policy_head_lr_scale', 1.0) or 1.0)
-        value_scale = float(getattr(self.args, 'value_head_lr_scale', 1.0) or 1.0)
-
-        if policy_scale <= 0:
-            logging.warning("policy_head_lr_scale<=0 is invalid. Falling back to 1.0")
-            policy_scale = 1.0
-        if value_scale <= 0:
-            logging.warning("value_head_lr_scale<=0 is invalid. Falling back to 1.0")
-            value_scale = 1.0
-        return policy_scale, value_scale
-
-    def _build_optimizer_with_head_lr_scales(self):
-        base_lr = float(self.args.learning_rate)
-        policy_scale, value_scale = self._get_head_lr_scales()
-
-        shared_and_policy_params = []
-        value_head_params = []
-        for name, param in self.nnet.named_parameters():
-            if name.startswith('val_'):
-                value_head_params.append(param)
-            else:
-                shared_and_policy_params.append(param)
-
-        if not shared_and_policy_params or not value_head_params:
-            logging.warning(
-                "Could not split policy/value parameter groups as expected. Falling back to single-group optimizer."
-            )
-            return optim.Adam(self.nnet.parameters(), lr=base_lr, weight_decay=self.args.weight_decay)
-
-        optimizer = optim.Adam(
-            [
-                {
-                    'params': shared_and_policy_params,
-                    'lr': base_lr * policy_scale,
-                    'group_name': 'policy_and_shared',
-                    'lr_scale': policy_scale,
-                },
-                {
-                    'params': value_head_params,
-                    'lr': base_lr * value_scale,
-                    'group_name': 'value_head',
-                    'lr_scale': value_scale,
-                },
-            ],
-            weight_decay=self.args.weight_decay,
-        )
-        logging.info(
-            "Head LR scales enabled: base_lr=%.6f, policy/shared=%.6f (x%.3f), value=%.6f (x%.3f)",
-            base_lr,
-            base_lr * policy_scale,
-            policy_scale,
-            base_lr * value_scale,
-            value_scale,
-        )
-        return optimizer
-
-    def _get_optimizer_group_scales(self):
-        scales = []
-        for idx, group in enumerate(self.optimizer.param_groups):
-            scale = group.get('lr_scale')
-            if scale is None:
-                if idx == 0:
-                    scale = float(getattr(self.args, 'policy_head_lr_scale', 1.0) or 1.0)
-                elif idx == 1:
-                    scale = float(getattr(self.args, 'value_head_lr_scale', 1.0) or 1.0)
-                else:
-                    scale = 1.0
-            scales.append(float(scale))
-        return scales
 
     def _initialize_option_a_recovery_state(self):
         if not bool(getattr(self.args, 'enable_option_a_recovery', False)):
@@ -858,22 +763,6 @@ class Trainer:
             teacher_bootstrap_metadata=self.teacher_bootstrap_metadata,
         )
 
-    def _is_teacher_pipeline_enabled(self):
-        auxiliary_eval_enabled = (
-            self.auxiliary_nnet is not None
-            and int(getattr(self.args, 'auxiliary_eval_games', 0) or 0) > 0
-            and int(getattr(self.args, 'auxiliary_eval_interval', 0) or 0) > 0
-        )
-        teacher_data_enabled = any([
-            int(getattr(self.args, 'teacher_bootstrap_num_games', 0) or 0) > 0,
-            int(getattr(self.args, 'teacher_bootstrap_warmup_iterations', 0) or 0) > 0,
-            float(getattr(self.args, 'teacher_replay_initial_ratio', 0.0) or 0.0) > 0.0,
-            float(getattr(self.args, 'teacher_replay_final_ratio', 0.0) or 0.0) > 0.0,
-            float(getattr(self.args, 'teacher_replay_drift_ratio', 0.0) or 0.0) > 0.0,
-        ])
-        has_teacher_data = bool(self.teacher_bootstrap_examples) or bool(self.teacher_opponent_history)
-        return bool(auxiliary_eval_enabled or teacher_data_enabled or has_teacher_data)
-
     def _evaluate_against_auxiliary_model(self, iteration):
         if self.auxiliary_nnet is None or self.auxiliary_model_config is None:
             return None
@@ -975,126 +864,27 @@ class Trainer:
         if step_size > 0:
             decay_steps = effective_iterations // step_size
 
-        decay_factor = gamma ** decay_steps
-        group_scales = self._get_optimizer_group_scales()
-        min_learning_rate = float(getattr(self.args, 'min_learning_rate', 0.0) or 0.0)
-        current_lrs = []
-        base_lrs = []
-        for idx, param_group in enumerate(self.optimizer.param_groups):
-            group_base_lr = base_lr * group_scales[idx]
-            group_current_lr = group_base_lr * decay_factor
-            if min_learning_rate > 0:
-                group_current_lr = max(group_current_lr, min_learning_rate * group_scales[idx])
-            base_lrs.append(group_base_lr)
-            current_lrs.append(group_current_lr)
-            param_group['lr'] = group_current_lr
-            param_group['lr_scale'] = group_scales[idx]
+        current_lr = base_lr * (gamma ** decay_steps)
+        self.scheduler.base_lrs = [base_lr for _ in self.optimizer.param_groups]
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = current_lr
         
         # Ensure scheduler internal state is also consistent
         self.scheduler.last_epoch = max(-1, int(completed_iterations) - 1)
-        self.scheduler.base_lrs = base_lrs
-        self.scheduler._last_lr = current_lrs
+        self.scheduler._last_lr = [current_lr for _ in self.optimizer.param_groups]
         logging.info(
-            "Scheduler aligned after resume: completed_iterations=%s, step_size=%s, gamma=%.6f, decay_steps=%s, lrs=%s",
+            "Scheduler aligned after resume: completed_iterations=%s, step_size=%s, gamma=%.6f, decay_steps=%s, lr=%.9f",
             int(completed_iterations),
             step_size,
             gamma,
             decay_steps,
-            [f"{lr:.9f}" for lr in current_lrs],
+            current_lr,
         )
 
     def _get_active_eval_interval(self):
         if self.boosted_eval_rounds_remaining > 0 and self.best_nnet is not None:
             return max(1, int(getattr(self.args, 'eval_interval_after_best', self.args.eval_interval)))
         return max(1, int(self.args.eval_interval))
-
-    def _get_best_file_paths(self):
-        recent_path = os.path.join(
-            self.args.checkpoint_dir,
-            getattr(self.args, 'best_recent_filename', 'best_new.pth.tar'),
-        )
-        older_path = os.path.join(
-            self.args.checkpoint_dir,
-            getattr(self.args, 'best_older_filename', 'best_old.pth.tar'),
-        )
-        legacy_path = os.path.join(
-            self.args.checkpoint_dir,
-            getattr(self.args, 'best_legacy_filename', 'best.pth.tar'),
-        )
-        return recent_path, older_path, legacy_path
-
-    def _load_checkpoint_payload_safely(self, path):
-        try:
-            with torch.serialization.safe_globals([np._core.multiarray._reconstruct]):
-                return torch.load(path, map_location='cpu')
-        except Exception:
-            try:
-                with torch.serialization.safe_globals([np.core.multiarray._reconstruct]):
-                    return torch.load(path, map_location='cpu')
-            except Exception:
-                return torch.load(path, map_location='cpu', weights_only=False)
-
-    def _build_model_from_state_dict(self, state_dict):
-        model = Connect4Net(num_channels=self.args.num_channels).to(self.args.train_device)
-        model.load_state_dict(state_dict)
-        return model
-
-    def _load_best_model_file(self, path):
-        if not os.path.exists(path):
-            return None, {}
-        payload = self._load_checkpoint_payload_safely(path)
-        state_dict = payload.get('state_dict') if isinstance(payload, dict) else payload
-        if state_dict is None:
-            return None, {}
-        model = self._build_model_from_state_dict(state_dict)
-        metadata = payload if isinstance(payload, dict) else {}
-        return model, metadata
-
-    def _load_best_generations_from_disk(self):
-        recent_path, older_path, legacy_path = self._get_best_file_paths()
-
-        self.best_nnet = None
-        self.older_best_nnet = None
-
-        recent_model, recent_meta = self._load_best_model_file(recent_path)
-        if recent_model is None and os.path.exists(legacy_path):
-            logging.info(
-                "No recent best file found (%s). Falling back to legacy best file (%s).",
-                recent_path,
-                legacy_path,
-            )
-            recent_model, recent_meta = self._load_best_model_file(legacy_path)
-
-        if recent_model is not None:
-            self.best_nnet = recent_model
-            self.best_model_iteration = recent_meta.get('best_model_iteration', self.best_model_iteration)
-            self.best_model_label = recent_meta.get('best_model_label', self.best_model_label)
-            self.best_win_rate = recent_meta.get('best_win_rate', self.best_win_rate)
-
-        older_model, older_meta = self._load_best_model_file(older_path)
-        if older_model is not None:
-            self.older_best_nnet = older_model
-            self.older_best_model_iteration = older_meta.get(
-                'older_best_model_iteration',
-                older_meta.get('best_model_iteration', self.older_best_model_iteration),
-            )
-            self.older_best_model_label = older_meta.get(
-                'older_best_model_label',
-                older_meta.get('best_model_label', self.older_best_model_label),
-            )
-            self.older_best_win_rate = older_meta.get(
-                'older_best_win_rate',
-                older_meta.get('best_win_rate', self.older_best_win_rate),
-            )
-
-        if self.best_nnet is not None:
-            logging.info(
-                "Loaded best generations for evaluation: recent=%s, older=%s",
-                self.best_model_label,
-                self.older_best_model_label if self.older_best_nnet is not None else 'none',
-            )
-        else:
-            logging.info("No best model found on disk. Evaluation will use random baseline until first promotion.")
 
     def _should_run_evaluation(self, iteration):
         return int(iteration) >= int(self.next_eval_iteration)
@@ -1143,23 +933,6 @@ class Trainer:
     def _log_iteration_summary(self, summary):
         train_metrics = summary['train_metrics']
         self_play_stats = summary.get('self_play_stats') or {}
-        train_line = (
-            f"  Train: total_samples={summary['train_samples']} | epochs={self.args.epochs} | "
-            f"duration={self._format_duration(train_metrics['duration_sec'])} | "
-            f"source={summary.get('train_data_mode', 'unknown')} | "
-            f"self_play_samples={summary.get('self_play_train_samples', 0)} | "
-            f"loss(total={train_metrics['total_loss']:.6f}, value={train_metrics['value_loss']:.6f}, policy={train_metrics['policy_loss']:.6f})"
-        )
-        show_teacher_train_fields = self.teacher_logging_enabled or summary.get('teacher_replay_samples', 0) > 0
-        if show_teacher_train_fields:
-            train_line = (
-                train_line + " | "
-                + f"teacher_replay_samples={summary.get('teacher_replay_samples', 0)} | "
-                + f"teacher_bootstrap={summary.get('teacher_bootstrap_replay_samples', 0)} | "
-                + f"teacher_opponent={summary.get('teacher_opponent_replay_samples', 0)} | "
-                + f"teacher_replay_ratio={summary.get('teacher_replay_ratio', 0.0):.3f}"
-            )
-
         lines = [
             (
                 f"Iter {summary['iteration']}/{self.args.num_iterations} | start={summary['start_time']} | "
@@ -1169,16 +942,24 @@ class Trainer:
             (
                 f"  Self-Play: games={summary['self_play_games']} | new_samples={summary['new_samples']} | "
                 f"avg_steps={self_play_stats.get('mean_steps', 0.0):.2f} | var_steps={self_play_stats.get('variance_steps', 0.0):.2f} | "
-                f"policy_entropy={self_play_stats.get('mean_policy_entropy', 0.0):.4f} | "
                 f"min/max={self_play_stats.get('min_steps', 0)}/{self_play_stats.get('max_steps', 0)} | "
-                f"long_games={self_play_stats.get('long_games', 0)} | short_games={self_play_stats.get('short_games', 0)} | "
                 f"filtered={self_play_stats.get('filtered_games', 0)} | "
                 f"duration={self._format_duration(summary['self_play_duration_sec'])}"
             ),
-            train_line,
+            (
+                f"  Train: total_samples={summary['train_samples']} | epochs={self.args.epochs} | "
+                f"duration={self._format_duration(train_metrics['duration_sec'])} | "
+                f"source={summary.get('train_data_mode', 'unknown')} | "
+                f"self_play_samples={summary.get('self_play_train_samples', 0)} | "
+                f"teacher_replay_samples={summary.get('teacher_replay_samples', 0)} | "
+                f"teacher_bootstrap={summary.get('teacher_bootstrap_replay_samples', 0)} | "
+                f"teacher_opponent={summary.get('teacher_opponent_replay_samples', 0)} | "
+                f"teacher_replay_ratio={summary.get('teacher_replay_ratio', 0.0):.3f} | "
+                f"loss(total={train_metrics['total_loss']:.6f}, value={train_metrics['value_loss']:.6f}, policy={train_metrics['policy_loss']:.6f})"
+            ),
         ]
 
-        if self.teacher_logging_enabled and summary.get('teacher_opponent_history_samples', 0) > 0:
+        if summary.get('teacher_opponent_history_samples', 0) > 0:
             lines.append(
                 f"  Teacher-History: replay_pool_samples={summary.get('teacher_opponent_history_samples', 0)}"
             )
@@ -1193,21 +974,6 @@ class Trainer:
                     f"no_improve_streak={eval_metrics['no_improve_streak']}"
                 )
             )
-            opponent_results = eval_metrics.get('opponent_results') or []
-            if opponent_results:
-                required_count = int(eval_metrics.get('required_opponent_count', len(opponent_results)))
-                required_threshold = float(eval_metrics.get('required_threshold', 0.0))
-                compact = []
-                for idx, item in enumerate(opponent_results):
-                    marker = 'required' if idx < required_count else 'optional'
-                    compact.append(
-                        f"{item.get('label', 'unknown')}[{marker}]={item.get('win_rate', 0.0):.3f}"
-                    )
-                lines.append(
-                    "  Eval-Best-Generations: "
-                    + " | ".join(compact)
-                    + f" | threshold={required_threshold:.3f} | decision={'pass' if eval_metrics.get('improved') else 'fail'}"
-                )
 
             auxiliary_teacher = eval_metrics.get('auxiliary_teacher')
             if auxiliary_teacher is not None:
@@ -1243,39 +1009,19 @@ class Trainer:
             return {
                 'mean_steps': 0.0,
                 'variance_steps': 0.0,
-                'mean_policy_entropy': 0.0,
-                'variance_policy_entropy': 0.0,
-                'min_policy_entropy': 0.0,
-                'max_policy_entropy': 0.0,
                 'min_steps': 0,
                 'max_steps': 0,
-                'long_games': 0,
-                'short_games': 0,
                 'filtered_games': 0,
                 'used_games': 0,
             }
 
         lengths = np.asarray([item.get('steps', 0) for item in game_results], dtype=np.float64)
-        entropies = np.asarray([item.get('policy_entropy_mean', 0.0) for item in game_results], dtype=np.float64)
         filtered_games = sum(0 if item.get('used_for_training', True) else 1 for item in game_results)
-        long_games = sum(
-            1
-            for item in game_results
-            if bool(item.get('used_for_training', True))
-            and float(item.get('long_game_weight', 1.0) or 1.0) > 1.0
-        )
-        short_games = sum(1 for item in game_results if int(item.get('steps', 0) or 0) < 10)
         return {
             'mean_steps': float(np.mean(lengths)),
             'variance_steps': float(np.var(lengths)),
-            'mean_policy_entropy': float(np.mean(entropies)),
-            'variance_policy_entropy': float(np.var(entropies)),
-            'min_policy_entropy': float(np.min(entropies)),
-            'max_policy_entropy': float(np.max(entropies)),
             'min_steps': int(np.min(lengths)),
             'max_steps': int(np.max(lengths)),
-            'long_games': int(long_games),
-            'short_games': int(short_games),
             'filtered_games': int(filtered_games),
             'used_games': int(len(game_results) - filtered_games),
         }
@@ -1324,7 +1070,6 @@ class Trainer:
             return None
         if eval_metrics['improved']:
             self.consecutive_no_improve_evals = 0
-            eval_metrics['no_improve_streak'] = 0
             return None
 
         self.consecutive_no_improve_evals += 1
@@ -1419,9 +1164,6 @@ class Trainer:
                 self.best_win_rate = checkpoint.get('best_win_rate', -1.0)
                 self.best_model_iteration = checkpoint.get('best_model_iteration', self.best_model_iteration)
                 self.best_model_label = checkpoint.get('best_model_label', self.best_model_label)
-                self.older_best_win_rate = checkpoint.get('older_best_win_rate', self.older_best_win_rate)
-                self.older_best_model_iteration = checkpoint.get('older_best_model_iteration', self.older_best_model_iteration)
-                self.older_best_model_label = checkpoint.get('older_best_model_label', self.older_best_model_label)
                 self.consecutive_no_improve_evals = checkpoint.get('consecutive_no_improve_evals', 0)
                 recent_losses = checkpoint.get('iteration_loss_history', [])
                 self.iteration_loss_history = deque(recent_losses, maxlen=self.args.loss_increase_patience)
@@ -1511,7 +1253,6 @@ class Trainer:
             inference_batch_size=self.args.inference_batch_size,
             inference_timeout_s=self.args.inference_timeout_s,
             model_state={k: v.detach().cpu() for k, v in self.nnet.state_dict().items()},
-            model_config=extract_model_config(self.nnet),
             progress_desc='Self-Play',
         )
 
@@ -1523,22 +1264,13 @@ class Trainer:
         else:
             target_workers = int(cpu_count * self.args.self_play_cpu_ratio)
 
-        search_budget = int(getattr(self.args, 'search_thread_budget', 0) or 0)
-        if search_budget <= 0:
-            search_budget = max(1, cpu_count)
-        search_limited_workers = max(
-            1,
-            search_budget // max(1, int(getattr(self.args, 'num_mcts_threads', 1) or 1)),
-        )
-        return max(1, min(self.args.max_self_play_workers, target_workers, total_games, search_limited_workers))
+        return max(1, min(self.args.max_self_play_workers, target_workers, total_games))
 
     def execute_evaluation_parallel(self, num_games, opponent_nnet=None, opponent_model_spec=None):
         num_workers = self._get_parallel_worker_count(num_games)
         opponent_state = None
-        opponent_config = None
         if opponent_nnet is not None:
             opponent_state = {k: v.detach().cpu() for k, v in opponent_nnet.state_dict().items()}
-            opponent_config = extract_model_config(opponent_nnet)
         return execute_evaluation_parallel(
             args=self.args,
             num_games=num_games,
@@ -1547,9 +1279,7 @@ class Trainer:
             inference_batch_size=self.args.inference_batch_size,
             inference_timeout_s=self.args.inference_timeout_s,
             new_model_state={k: v.detach().cpu() for k, v in self.nnet.state_dict().items()},
-            new_model_config=extract_model_config(self.nnet),
             opponent_nnet_state=opponent_state,
-            opponent_nnet_config=opponent_config,
             opponent_model_spec=opponent_model_spec,
         )
 
@@ -1578,7 +1308,6 @@ class Trainer:
                 )
                 iter_examples = []
                 self_play_game_results = []
-                self.last_self_play_game_results = []
                 self_play_duration = 0.0
                 self_play_stats = self._summarize_self_play_lengths(self_play_game_results)
             else:
@@ -1586,7 +1315,6 @@ class Trainer:
                 iter_examples, self_play_game_results = self.execute_episode_parallel()
                 self_play_duration = time.perf_counter() - self_play_start
                 self_play_stats = self._summarize_self_play_lengths(self_play_game_results)
-                self.last_self_play_game_results = list(self_play_game_results)
                 self.train_examples_history.append(iter_examples)
 
                 history_before_prune = len(self.train_examples_history)
@@ -1609,14 +1337,13 @@ class Trainer:
             gc.collect()
             
             self.scheduler.step()
-            self._apply_min_learning_rate()
             
             # 3. Save Checkpoint & Evaluate
             eval_metrics = None
             checkpoint_saved = False
             adaptive_notes = []
             if i % self.args.checkpoint_interval == 0:
-                self.save_checkpoint(i, self.last_self_play_game_results)
+                self.save_checkpoint(i)
                 checkpoint_saved = True
             if self._should_run_evaluation(i):
                 eval_metrics = self.evaluate_model(i)
@@ -1628,10 +1355,9 @@ class Trainer:
             iteration_duration = time.perf_counter() - iteration_start
             last_completed_iteration = i
 
-            eval_stop_reason = self._check_eval_early_stop(eval_metrics)
             stop_reason = self._check_loss_early_stop(i, train_metrics['total_loss'])
             if stop_reason is None:
-                stop_reason = eval_stop_reason
+                stop_reason = self._check_eval_early_stop(eval_metrics)
 
             iteration_summary = {
                 'iteration': i,
@@ -1671,13 +1397,13 @@ class Trainer:
             if stop_reason:
                 logging.info(f"Early stopping triggered at iteration {i}: {stop_reason}")
                 if not checkpoint_saved:
-                    self.save_checkpoint(i, self.last_self_play_game_results)
+                    self.save_checkpoint(i)
                 break
 
         # 训练循环结束后：确保最终模型被保存一次
         logging.info("Saving final checkpoint...")
         if last_completed_iteration >= self.start_iter:
-            self.save_checkpoint(last_completed_iteration, self.last_self_play_game_results)
+            self.save_checkpoint(last_completed_iteration)
         self.final_report(last_completed_iteration)
 
     def train_network(self, examples, iteration):
@@ -1822,7 +1548,7 @@ class Trainer:
         metrics['policy_loss'] = total_policy_loss_sum / max(1, total_batches)
         return metrics
 
-    def save_checkpoint(self, iteration, self_play_game_results=None):
+    def save_checkpoint(self, iteration):
         """
         Saves the training state and model weights.
         """
@@ -1853,88 +1579,8 @@ class Trainer:
         
         # Legacy/Simple model save (weights only)
         torch.save(self.nnet.state_dict(), model_filepath)
-        self._save_self_play_sample_json(iteration, folder, self_play_game_results)
         
         logging.info(f"Checkpoint saved: {filepath}")
-
-    def _select_equally_spaced_indices(self, start_idx, end_idx, target_count):
-        if end_idx < start_idx:
-            return []
-        total = end_idx - start_idx + 1
-        if total <= target_count:
-            return list(range(start_idx, end_idx + 1))
-
-        linspace_values = np.linspace(start_idx, end_idx, num=target_count)
-        rounded = [int(round(v)) for v in linspace_values]
-        deduped = []
-        for idx in rounded:
-            if not deduped or idx != deduped[-1]:
-                deduped.append(idx)
-        if len(deduped) < target_count:
-            for idx in range(start_idx, end_idx + 1):
-                if idx not in deduped:
-                    deduped.append(idx)
-                if len(deduped) >= target_count:
-                    break
-        return sorted(deduped[:target_count])
-
-    def _save_self_play_sample_json(self, iteration, checkpoint_folder, self_play_game_results):
-        if not self_play_game_results:
-            return
-
-        valid_games = [
-            game for game in self_play_game_results
-            if int(game.get('steps', 0) or 0) > 0 and isinstance(game.get('trace'), dict)
-        ]
-        if not valid_games:
-            return
-
-        sorted_games = sorted(valid_games, key=lambda item: int(item.get('steps', 0) or 0))
-        if len(sorted_games) <= 2:
-            sampled_indices = list(range(len(sorted_games)))
-        else:
-            sampled_indices = self._select_equally_spaced_indices(
-                start_idx=1,
-                end_idx=len(sorted_games) - 2,
-                target_count=min(5, len(sorted_games) - 2),
-            )
-        if not sampled_indices:
-            return
-
-        sampled_games = []
-        for rank, idx in enumerate(sampled_indices, start=1):
-            game_data = sorted_games[idx]
-            trace = game_data.get('trace') or {}
-            sampled_games.append({
-                'sample_rank': int(rank),
-                'game_idx': int(game_data.get('game_idx', -1)),
-                'steps': int(game_data.get('steps', 0) or 0),
-                'used_for_training': bool(game_data.get('used_for_training', False)),
-                'policy_entropy_mean': float(game_data.get('policy_entropy_mean', 0.0) or 0.0),
-                'winner': int(trace.get('winner', 0) or 0),
-                'is_draw': bool(trace.get('is_draw', False)),
-                'result_code': float(trace.get('result_code', 0.0) or 0.0),
-                'moves': list(trace.get('moves', [])),
-            })
-
-        sample_payload = {
-            'iteration': int(iteration),
-            'source': 'self_play_stage',
-            'sampling_rule': {
-                'method': 'equally_spaced_by_steps',
-                'sorted_by': 'steps_ascending',
-                'range': 'from_second_shortest_to_second_longest',
-                'target_games': 5,
-                'actual_games': len(sampled_games),
-            },
-            'total_games_considered': len(sorted_games),
-            'samples': sampled_games,
-        }
-
-        sample_path = os.path.join(checkpoint_folder, 'self_play_samples.json')
-        with open(sample_path, 'w', encoding='utf-8') as f:
-            json.dump(sample_payload, f, ensure_ascii=False, indent=2)
-        logging.info("Saved self-play sample JSON: %s", sample_path)
 
     def _build_training_state(self, iteration, model_state=None, checkpoint_kind='checkpoint'):
         if model_state is None:
@@ -1952,9 +1598,6 @@ class Trainer:
             'best_win_rate': self.best_win_rate,
             'best_model_iteration': self.best_model_iteration,
             'best_model_label': self.best_model_label,
-            'older_best_win_rate': self.older_best_win_rate,
-            'older_best_model_iteration': self.older_best_model_iteration,
-            'older_best_model_label': self.older_best_model_label,
             'consecutive_no_improve_evals': self.consecutive_no_improve_evals,
             'iteration_loss_history': list(self.iteration_loss_history),
             'stop_reason': self.stop_reason,
@@ -1972,40 +1615,16 @@ class Trainer:
 
     def save_best_model(self):
         """
-        Rotates and saves two best generations (recent + older).
+        Separately saves the best performing model.
         """
-        recent_path, older_path, legacy_path = self._get_best_file_paths()
-
-        if os.path.exists(older_path):
-            os.remove(older_path)
-        if os.path.exists(recent_path):
-            shutil.move(recent_path, older_path)
-
-        self.best_nnet = self._build_model_from_state_dict(self.nnet.state_dict())
-
-        recent_state = self._build_training_state(
+        best_filepath = os.path.join(self.args.checkpoint_dir, 'best.pth.tar')
+        state = self._build_training_state(
             self.best_model_iteration,
             model_state=self.best_nnet.state_dict(),
-            checkpoint_kind='best_recent',
+            checkpoint_kind='best',
         )
-        torch.save(recent_state, recent_path)
-        # Keep legacy alias for backward compatibility.
-        torch.save(recent_state, legacy_path)
-
-        if self.older_best_nnet is not None:
-            older_state = self._build_training_state(
-                self.older_best_model_iteration,
-                model_state=self.older_best_nnet.state_dict(),
-                checkpoint_kind='best_older',
-            )
-            torch.save(older_state, older_path)
-
-        logging.info(
-            "Updated BEST rotation: recent=%s (win_rate=%.3f), older=%s",
-            recent_path,
-            self.best_win_rate,
-            self.older_best_model_label if self.older_best_nnet is not None else 'none',
-        )
+        torch.save(state, best_filepath)
+        logging.info(f"Updated BEST model saved: {best_filepath} (WinRate: {self.best_win_rate:.3f})")
         self.cleanup_checkpoints()
 
     def cleanup_checkpoints(self):
@@ -2039,100 +1658,36 @@ class Trainer:
 
     def evaluate_model(self, iteration):
         """
-        Evaluate the current model against recent/older best generations.
-        The model is promoted only if it passes all required opponent thresholds.
+        AlphaZero-style evaluation: Pit the current model against the best model so far.
+        If the current model wins by a margin (update_threshold), it becomes the new best.
+        If no best model exists, it competes against a random strategy.
         """
-        games_per_best = max(2, int(getattr(self.args, 'best_eval_games_per_generation', self.args.eval_games)))
-        threshold = float(getattr(self.args, 'best_update_threshold', getattr(self.args, 'update_threshold', 0.55)))
-        required_generations = max(1, int(getattr(self.args, 'best_eval_required_generations', 2)))
-
-        opponents = []
-        if self.best_nnet is not None:
-            opponents.append(('recent_best', self.best_model_label, self.best_nnet))
-        if self.older_best_nnet is not None:
-            opponents.append(('older_best', self.older_best_model_label, self.older_best_nnet))
-        if not opponents:
-            opponents.append(('random_model', 'random_model', None))
-
-        logging.info(
-            "--- Evaluating model at iteration %s against %s opponent generations (games each=%s) ---",
-            iteration,
-            len(opponents),
-            games_per_best,
-        )
-
-        def _run_one_eval(opponent_item):
-            key, label, model_ref = opponent_item
-            wins_i, losses_i, draws_i = self.execute_evaluation_parallel(games_per_best, opponent_nnet=model_ref)
-            win_rate_i = (wins_i + 0.5 * draws_i) / games_per_best
-            return {
-                'key': key,
-                'label': label,
-                'wins': wins_i,
-                'losses': losses_i,
-                'draws': draws_i,
-                'games': games_per_best,
-                'win_rate': win_rate_i,
-            }
-
-        parallel_eval = bool(getattr(self.args, 'best_eval_parallelize_generations', True)) and len(opponents) > 1
-        if parallel_eval:
-            with ThreadPoolExecutor(max_workers=len(opponents)) as executor:
-                opponent_results = list(executor.map(_run_one_eval, opponents))
-        else:
-            opponent_results = [_run_one_eval(item) for item in opponents]
-
-        for result in opponent_results:
-            logging.info(
-                "Pitting Result vs %s - Wins: %s, Losses: %s, Draws: %s | WinRate: %.3f",
-                result['label'],
-                result['wins'],
-                result['losses'],
-                result['draws'],
-                result['win_rate'],
-            )
-
-        required_count = required_generations if len(opponent_results) >= required_generations else len(opponent_results)
-        required_results = opponent_results[:required_count]
-        improved = bool(required_results) and all(item['win_rate'] >= threshold for item in required_results)
-
-        primary_result = opponent_results[0]
-        opponent_label = primary_result['label']
-        wins, losses, draws = primary_result['wins'], primary_result['losses'], primary_result['draws']
-        num_games = primary_result['games']
-        win_rate = primary_result['win_rate']
-
+        opponent_label = self.best_model_label if self.best_nnet is not None else 'random_model'
+        logging.info(f"--- Evaluating model vs {opponent_label} at iteration {iteration} ---")
+        
+        num_games = self.args.eval_games
+        wins, losses, draws = self.execute_evaluation_parallel(num_games, opponent_nnet=self.best_nnet)
+                    
+        win_rate = (wins + 0.5 * draws) / num_games
+        logging.info(f"Pitting Result - Wins: {wins}, Losses: {losses}, Draws: {draws} | WinRate: {win_rate:.3f}")
+        
+        # Update best model if win_rate exceeds threshold
+        improved = win_rate >= self.args.update_threshold
         if improved:
-            passed_labels = ', '.join(item['label'] for item in required_results)
-            logging.info(
-                "SUCCESS: New model passed all required best generations (threshold=%.3f): %s. Updating best.",
-                threshold,
-                passed_labels,
-            )
-            previous_best_model = self.best_nnet
-            previous_best_iteration = self.best_model_iteration
-            previous_best_label = self.best_model_label
-            previous_best_win_rate = self.best_win_rate
-
+            logging.info(f"SUCCESS: New model is better than {opponent_label} (Threshold: {self.args.update_threshold}). Updating best.")
+            self.best_win_rate = win_rate
             self.best_model_iteration = iteration
             self.best_model_label = f'checkpoint_{iteration}'
-            self.best_win_rate = min(item['win_rate'] for item in required_results)
-
-            self.older_best_nnet = previous_best_model
-            self.older_best_model_iteration = previous_best_iteration
-            self.older_best_model_label = previous_best_label
-            self.older_best_win_rate = previous_best_win_rate
-
             self.boosted_eval_rounds_remaining = max(
                 self.boosted_eval_rounds_remaining,
                 max(1, int(getattr(self.args, 'eval_boost_rounds_after_improve', 2))),
             )
+            if self.best_nnet is None:
+                self.best_nnet = Connect4Net(num_channels=self.args.num_channels).to(self.args.train_device)
+            self.best_nnet.load_state_dict(self.nnet.state_dict())
             self.save_best_model()
         else:
-            logging.info(
-                "REJECTED: New model rejected. Need >= %.3f against required best generations.",
-                threshold,
-            )
+            logging.info(f"REJECTED: New model rejected. {opponent_label} remains the baseline.")
 
         random_baseline = None
         auxiliary_teacher = self._evaluate_against_auxiliary_model(iteration)
@@ -2177,9 +1732,6 @@ class Trainer:
             'games': num_games,
             'win_rate': win_rate,
             'opponent_label': opponent_label,
-            'opponent_results': opponent_results,
-            'required_opponent_count': required_count,
-            'required_threshold': threshold,
             'improved': improved,
             'no_improve_streak': 0,
             'random_baseline': random_baseline,
@@ -2219,20 +1771,13 @@ class Trainer:
                 f.write("\n=== Self-Play Length Summary ===\n")
                 mean_series = [float(item.get('mean_steps', 0.0)) for item in self_play_summaries]
                 variance_series = [float(item.get('variance_steps', 0.0)) for item in self_play_summaries]
-                entropy_series = [float(item.get('mean_policy_entropy', 0.0)) for item in self_play_summaries]
                 last_steps = self_play_summaries[-1]
                 f.write(f"Average of Iteration Mean Steps: {sum(mean_series) / len(mean_series):.3f}\n")
                 f.write(f"Average of Iteration Step Variance: {sum(variance_series) / len(variance_series):.3f}\n")
-                f.write(f"Average of Iteration Policy Entropy: {sum(entropy_series) / len(entropy_series):.4f}\n")
                 f.write(
                     f"Last Iteration Steps: mean {last_steps.get('mean_steps', 0.0):.3f}, "
                     f"variance {last_steps.get('variance_steps', 0.0):.3f}, "
                     f"min/max {last_steps.get('min_steps', 0)}/{last_steps.get('max_steps', 0)}\n"
-                )
-                f.write(
-                    f"Last Iteration Policy Entropy: mean {last_steps.get('mean_policy_entropy', 0.0):.4f}, "
-                    f"variance {last_steps.get('variance_policy_entropy', 0.0):.4f}, "
-                    f"min/max {last_steps.get('min_policy_entropy', 0.0):.4f}/{last_steps.get('max_policy_entropy', 0.0):.4f}\n"
                 )
             if len(self.auxiliary_eval_history) > 0:
                 f.write("\n=== Auxiliary Teacher Summary ===\n")

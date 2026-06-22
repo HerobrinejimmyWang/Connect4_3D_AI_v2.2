@@ -187,9 +187,12 @@ def play_self_play_game(game, predictor, args, seed):
 
         result = game.get_game_ended(board, cur_player)
         if result == 0:
+            mcts.advance_to_action(action, game.get_canonical_form(board, cur_player))
             continue
 
         if use_min_step_filter and episode_step < args.min_game_steps:
+            search_stats = mcts.get_search_stats()
+            mcts.close()
             return {
                 'examples': [],
                 'steps': int(episode_step),
@@ -203,6 +206,7 @@ def play_self_play_game(game, predictor, args, seed):
                     'is_draw': bool(result == 1e-4),
                     'result_code': float(result),
                 },
+                'search_stats': search_stats,
             }
 
         winner = 0
@@ -216,6 +220,8 @@ def play_self_play_game(game, predictor, args, seed):
             reward = result * (1 if state_player == cur_player else -1)
             for board_sym, policy_sym in game.get_symmetries(canonical_state, policy):
                 return_data.append((board_sym.astype(np.int8), policy_sym.astype(np.float32), float(reward)))
+        search_stats = mcts.get_search_stats()
+        mcts.close()
         return {
             'examples': return_data,
             'steps': int(episode_step),
@@ -229,6 +235,7 @@ def play_self_play_game(game, predictor, args, seed):
                 'is_draw': bool(result == 1e-4),
                 'result_code': float(result),
             },
+            'search_stats': search_stats,
         }
 
 
@@ -246,6 +253,8 @@ def self_play_worker_loop(worker_id, task_queue, result_queue, request_queue, re
             result_queue.put((int(game_idx), game_data))
     finally:
         predictor.close()
+        result_queue.close()
+        result_queue.join_thread()
 
 
 def play_evaluation_game(game, new_predictor, best_predictor, args, game_idx, seed):
@@ -284,7 +293,14 @@ def play_evaluation_game(game, new_predictor, best_predictor, args, game_idx, se
         board, cur_player = game.get_next_state(board, cur_player, action)
         result = game.get_game_ended(board, 1)
         if result == 0:
+            next_canonical = game.get_canonical_form(board, cur_player)
+            mcts_new.advance_to_action(action, next_canonical)
+            if mcts_best is not None:
+                mcts_best.advance_to_action(action, next_canonical)
             continue
+        mcts_new.close()
+        if mcts_best is not None:
+            mcts_best.close()
         if result == 1e-4:
             return 'draw'
         if (result == 1 and new_model_player == 1) or (result == -1 and new_model_player == -1):
@@ -373,6 +389,9 @@ def play_teacher_failure_game(game, model_predictor, teacher_predictor, args, ga
         board, cur_player = game.get_next_state(board, cur_player, action)
         result = game.get_game_ended(board, cur_player)
         if result == 0:
+            next_canonical = game.get_canonical_form(board, cur_player)
+            model_mcts.advance_to_action(action, next_canonical)
+            teacher_mcts.advance_to_action(action, next_canonical)
             continue
 
         if result == 1e-4:
@@ -395,6 +414,12 @@ def play_teacher_failure_game(game, model_predictor, teacher_predictor, args, ga
                         )
                     )
 
+        search_stats = {
+            'model': model_mcts.get_search_stats(),
+            'teacher': teacher_mcts.get_search_stats(),
+        }
+        model_mcts.close()
+        teacher_mcts.close()
         return {
             'examples': failure_examples,
             'steps': int(episode_step),
@@ -402,6 +427,7 @@ def play_teacher_failure_game(game, model_predictor, teacher_predictor, args, ga
             'model_player': int(model_player),
             'outcome_for_model': float(outcome_for_model),
             'captured_positions': len(collected_positions),
+            'search_stats': search_stats,
         }
 
 
@@ -432,6 +458,8 @@ def evaluation_worker_loop(
         new_predictor.close()
         if best_predictor is not None:
             best_predictor.close()
+        result_queue.close()
+        result_queue.join_thread()
 
 
 def teacher_failure_worker_loop(
@@ -467,6 +495,8 @@ def teacher_failure_worker_loop(
     finally:
         model_predictor.close()
         teacher_predictor.close()
+        result_queue.close()
+        result_queue.join_thread()
 
 
 def _close_processes(worker_processes):
@@ -474,27 +504,6 @@ def _close_processes(worker_processes):
         if process.is_alive():
             process.terminate()
             process.join(timeout=2.0)
-
-
-def _get_server_factory(compatible_model_spec):
-    if compatible_model_spec is None:
-        return lambda response_conns, device, batch_size, batch_timeout_s: GlobalInferenceServer(
-            model_state=compatible_model_spec,
-            worker_response_conns=response_conns,
-            device=device,
-            batch_size=batch_size,
-            batch_timeout_s=batch_timeout_s,
-        )
-    action_size = GameRules().get_action_size()
-    return lambda response_conns, device, batch_size, batch_timeout_s: CompatibleGlobalInferenceServer(
-        model_state=compatible_model_spec['state_dict'],
-        model_config=compatible_model_spec['config'],
-        action_size=action_size,
-        worker_response_conns=response_conns,
-        device=device,
-        batch_size=batch_size,
-        batch_timeout_s=batch_timeout_s,
-    )
 
 
 def _resolve_self_play_server_count(args, num_workers, compatible_model_spec):
@@ -513,6 +522,17 @@ def _resolve_self_play_server_count(args, num_workers, compatible_model_spec):
     return max(1, min(configured, num_workers))
 
 
+def _resolve_effective_batch_size(args, requested_batch_size, num_workers):
+    threads = max(
+        1,
+        int(getattr(args, 'num_mcts_threads', 1) or 1),
+        int(getattr(args, 'model_num_mcts_threads', 1) or 1),
+        int(getattr(args, 'teacher_num_mcts_threads', 1) or 1),
+    )
+    active_request_limit = max(1, int(num_workers) * threads)
+    return max(1, min(int(requested_batch_size), active_request_limit))
+
+
 def _build_self_play_servers(
     model_state,
     model_config,
@@ -521,6 +541,7 @@ def _build_self_play_servers(
     inference_batch_size,
     inference_timeout_s,
     server_count,
+    inference_precision,
 ):
     server_count = max(1, int(server_count))
     if compatible_model_spec is None:
@@ -533,6 +554,7 @@ def _build_self_play_servers(
                 device=shared_inference_device,
                 batch_size=inference_batch_size,
                 batch_timeout_s=inference_timeout_s,
+                inference_precision=inference_precision,
             )
             for response_conns in server_response_conns
         ]
@@ -548,6 +570,7 @@ def _build_self_play_servers(
                 device=shared_inference_device,
                 batch_size=inference_batch_size,
                 batch_timeout_s=inference_timeout_s,
+                inference_precision=inference_precision,
             )
             for response_conns in server_response_conns
         ]
@@ -577,6 +600,12 @@ def execute_self_play_parallel(
     worker_processes = []
     worker_specs = []
     server_count = _resolve_self_play_server_count(args, num_workers, compatible_model_spec)
+    if server_count > 1 and str(shared_inference_device).startswith('cuda'):
+        logging.warning(
+            'Using %s inference servers for one model on a single GPU can increase VRAM use and CUDA context contention.',
+            server_count,
+        )
+    inference_batch_size = _resolve_effective_batch_size(args, inference_batch_size, num_workers)
     servers, server_response_conns = _build_self_play_servers(
         model_state,
         model_config,
@@ -585,6 +614,7 @@ def execute_self_play_parallel(
         inference_batch_size,
         inference_timeout_s,
         server_count,
+        str(getattr(args, 'inference_precision', 'fp32')),
     )
 
     for game_idx in range(num_games):
@@ -792,6 +822,8 @@ def execute_evaluation_parallel(
     new_response_conns = {}
     best_response_conns = {}
     worker_processes = []
+    inference_batch_size = _resolve_effective_batch_size(args, inference_batch_size, num_workers)
+    inference_precision = str(getattr(args, 'inference_precision', 'fp32'))
 
     for game_idx in range(num_games):
         task_queue.put(game_idx)
@@ -805,6 +837,7 @@ def execute_evaluation_parallel(
         device=shared_inference_device,
         batch_size=inference_batch_size,
         batch_timeout_s=inference_timeout_s,
+        inference_precision=inference_precision,
     )
 
     best_inference_server = None
@@ -816,6 +849,7 @@ def execute_evaluation_parallel(
             device=shared_inference_device,
             batch_size=inference_batch_size,
             batch_timeout_s=inference_timeout_s,
+            inference_precision=inference_precision,
         )
     elif opponent_model_spec is not None:
         best_inference_server = CompatibleGlobalInferenceServer(
@@ -826,6 +860,7 @@ def execute_evaluation_parallel(
             device=shared_inference_device,
             batch_size=inference_batch_size,
             batch_timeout_s=inference_timeout_s,
+            inference_precision=inference_precision,
         )
 
     base_seed = int(time.time())
@@ -916,6 +951,178 @@ def execute_evaluation_parallel(
     return wins, losses, draws
 
 
+def execute_evaluation_group_parallel(
+    args,
+    matches,
+    total_workers,
+    shared_inference_device,
+    inference_batch_size,
+    inference_timeout_s,
+    new_model_state,
+    new_model_config=None,
+):
+    """Run several opponents with one shared candidate-model inference service."""
+    matches = [dict(match) for match in matches if int(match.get('num_games', 0)) > 0]
+    if not matches:
+        return []
+
+    group_count = len(matches)
+    workers_per_match = max(1, int(total_workers) // group_count)
+    inference_batch_size = _resolve_effective_batch_size(
+        args,
+        inference_batch_size,
+        workers_per_match * group_count,
+    )
+    inference_precision = str(getattr(args, 'inference_precision', 'fp32'))
+    candidate_response_conns = {}
+    candidate_server = GlobalInferenceServer(
+        model_state=new_model_state,
+        worker_response_conns=candidate_response_conns,
+        model_config=new_model_config,
+        device=shared_inference_device,
+        batch_size=inference_batch_size,
+        batch_timeout_s=inference_timeout_s,
+        inference_precision=inference_precision,
+    )
+
+    runtimes = []
+    worker_processes = []
+    next_worker_id = 0
+    base_seed = int(time.time())
+    try:
+        for match_index, match in enumerate(matches):
+            games = int(match['num_games'])
+            local_workers = min(games, workers_per_match)
+            task_queue = mp.Queue()
+            result_queue = mp.Queue()
+            opponent_response_conns = {}
+            for game_idx in range(games):
+                task_queue.put(game_idx)
+            for _ in range(local_workers):
+                task_queue.put(None)
+
+            opponent_state = match.get('opponent_nnet_state')
+            opponent_spec = match.get('opponent_model_spec')
+            if opponent_state is not None and opponent_spec is not None:
+                raise ValueError('Grouped evaluation opponent formats are mutually exclusive.')
+            if opponent_state is not None:
+                opponent_server = GlobalInferenceServer(
+                    model_state=opponent_state,
+                    worker_response_conns=opponent_response_conns,
+                    model_config=match.get('opponent_nnet_config'),
+                    device=shared_inference_device,
+                    batch_size=inference_batch_size,
+                    batch_timeout_s=inference_timeout_s,
+                    inference_precision=inference_precision,
+                )
+            elif opponent_spec is not None:
+                opponent_server = CompatibleGlobalInferenceServer(
+                    model_state=opponent_spec['state_dict'],
+                    model_config=opponent_spec['config'],
+                    action_size=GameRules().get_action_size(),
+                    worker_response_conns=opponent_response_conns,
+                    device=shared_inference_device,
+                    batch_size=inference_batch_size,
+                    batch_timeout_s=inference_timeout_s,
+                    inference_precision=inference_precision,
+                )
+            else:
+                opponent_server = None
+
+            worker_specs = []
+            for local_worker in range(local_workers):
+                worker_id = next_worker_id
+                next_worker_id += 1
+                candidate_recv, candidate_send = mp.Pipe(duplex=False)
+                candidate_response_conns[worker_id] = candidate_send
+                opponent_recv = None
+                if opponent_server is not None:
+                    opponent_recv, opponent_send = mp.Pipe(duplex=False)
+                    opponent_response_conns[worker_id] = opponent_send
+                worker_specs.append((worker_id, candidate_recv, opponent_recv))
+            runtimes.append(
+                {
+                    'match': match,
+                    'games': games,
+                    'task_queue': task_queue,
+                    'result_queue': result_queue,
+                    'opponent_server': opponent_server,
+                    'opponent_response_conns': opponent_response_conns,
+                    'worker_specs': worker_specs,
+                }
+            )
+
+        candidate_server.start()
+        for runtime in runtimes:
+            opponent_server = runtime['opponent_server']
+            if opponent_server is not None:
+                opponent_server.start()
+            for worker_id, candidate_recv, opponent_recv in runtime['worker_specs']:
+                process = mp.Process(
+                    target=evaluation_worker_loop,
+                    args=(
+                        worker_id,
+                        runtime['task_queue'],
+                        runtime['result_queue'],
+                        candidate_server.request_queue,
+                        candidate_recv,
+                        opponent_server.request_queue if opponent_server is not None else None,
+                        opponent_recv,
+                        args,
+                        base_seed + worker_id * 100000,
+                    ),
+                )
+                process.start()
+                worker_processes.append(process)
+                candidate_recv.close()
+                if opponent_recv is not None:
+                    opponent_recv.close()
+
+        for conn in candidate_response_conns.values():
+            conn.close()
+        for runtime in runtimes:
+            for conn in runtime['opponent_response_conns'].values():
+                conn.close()
+
+        grouped_results = []
+        for runtime in runtimes:
+            wins = losses = draws = completed = 0
+            games = runtime['games']
+            progress = tqdm(total=games, desc=f"Evaluation {runtime['match'].get('label', '')}")
+            while completed < games:
+                try:
+                    _, result = runtime['result_queue'].get(timeout=5.0)
+                except queue.Empty:
+                    failures = [p.exitcode for p in worker_processes if p.exitcode not in (0, None)]
+                    if failures:
+                        raise RuntimeError(f'Grouped evaluation worker failed: {failures}')
+                    continue
+                wins += int(result == 'win')
+                losses += int(result == 'loss')
+                draws += int(result == 'draw')
+                completed += 1
+                progress.update(1)
+            progress.close()
+            grouped_results.append((wins, losses, draws))
+
+        for process in worker_processes:
+            process.join()
+            if process.exitcode not in (0, None):
+                raise RuntimeError(f'Grouped evaluation worker exited with code {process.exitcode}')
+        return grouped_results
+    finally:
+        _close_processes(worker_processes)
+        candidate_server.close()
+        for runtime in runtimes:
+            opponent_server = runtime['opponent_server']
+            if opponent_server is not None:
+                opponent_server.close()
+            runtime['task_queue'].close()
+            runtime['task_queue'].join_thread()
+            runtime['result_queue'].close()
+            runtime['result_queue'].join_thread()
+
+
 def execute_teacher_failure_parallel(
     args,
     num_games,
@@ -926,37 +1133,55 @@ def execute_teacher_failure_parallel(
     model_state,
     teacher_model_spec,
     progress_desc='Teacher Failure Collection',
+    model_config=None,
+    model_inference_batch_size=None,
+    model_inference_timeout_s=None,
+    teacher_inference_batch_size=None,
+    teacher_inference_timeout_s=None,
+    model_inference_server_count=1,
+    teacher_inference_server_count=1,
 ):
     if teacher_model_spec is None:
         raise ValueError('teacher_model_spec must be provided for teacher failure collection.')
 
     task_queue = mp.Queue()
     result_queue = mp.Queue()
-    model_response_conns = {}
-    teacher_response_conns = {}
     worker_processes = []
+    model_batch_size = _resolve_effective_batch_size(
+        args, model_inference_batch_size or inference_batch_size, num_workers
+    )
+    teacher_batch_size = _resolve_effective_batch_size(
+        args, teacher_inference_batch_size or inference_batch_size, num_workers
+    )
+    inference_precision = str(getattr(args, 'inference_precision', 'fp32'))
 
     for game_idx in range(num_games):
         task_queue.put(game_idx)
     for _ in range(num_workers):
         task_queue.put(None)
 
-    model_inference_server = GlobalInferenceServer(
-        model_state=model_state,
-        worker_response_conns=model_response_conns,
-        device=shared_inference_device,
-        batch_size=inference_batch_size,
-        batch_timeout_s=inference_timeout_s,
+    model_servers, model_response_conns = _build_self_play_servers(
+        model_state,
+        model_config,
+        None,
+        shared_inference_device,
+        model_batch_size,
+        model_inference_timeout_s if model_inference_timeout_s is not None else inference_timeout_s,
+        max(1, min(int(model_inference_server_count), num_workers)),
+        inference_precision,
     )
-    teacher_inference_server = CompatibleGlobalInferenceServer(
-        model_state=teacher_model_spec['state_dict'],
-        model_config=teacher_model_spec['config'],
-        action_size=GameRules().get_action_size(),
-        worker_response_conns=teacher_response_conns,
-        device=shared_inference_device,
-        batch_size=inference_batch_size,
-        batch_timeout_s=inference_timeout_s,
+    teacher_servers, teacher_response_conns = _build_self_play_servers(
+        None,
+        None,
+        teacher_model_spec,
+        shared_inference_device,
+        teacher_batch_size,
+        teacher_inference_timeout_s if teacher_inference_timeout_s is not None else inference_timeout_s,
+        max(1, min(int(teacher_inference_server_count), num_workers)),
+        inference_precision,
     )
+    if (len(model_servers) > 1 or len(teacher_servers) > 1) and str(shared_inference_device).startswith('cuda'):
+        logging.warning('Multiple teacher-failure inference servers may contend for single-GPU memory and contexts.')
 
     base_seed = int(time.time())
     iteration_examples = []
@@ -970,31 +1195,35 @@ def execute_teacher_failure_parallel(
     )
 
     try:
-        model_worker_recv_conns = []
-        teacher_worker_recv_conns = []
+        worker_specs = []
         for worker_id in range(num_workers):
             model_worker_recv_conn, model_server_send_conn = mp.Pipe(duplex=False)
             teacher_worker_recv_conn, teacher_server_send_conn = mp.Pipe(duplex=False)
-            model_response_conns[worker_id] = model_server_send_conn
-            teacher_response_conns[worker_id] = teacher_server_send_conn
-            model_worker_recv_conns.append(model_worker_recv_conn)
-            teacher_worker_recv_conns.append(teacher_worker_recv_conn)
+            model_index = worker_id % len(model_servers)
+            teacher_index = worker_id % len(teacher_servers)
+            model_response_conns[model_index][worker_id] = model_server_send_conn
+            teacher_response_conns[teacher_index][worker_id] = teacher_server_send_conn
+            worker_specs.append((
+                worker_id,
+                model_worker_recv_conn,
+                model_servers[model_index].request_queue,
+                teacher_worker_recv_conn,
+                teacher_servers[teacher_index].request_queue,
+            ))
 
-        model_inference_server.start()
-        teacher_inference_server.start()
+        for server in model_servers + teacher_servers:
+            server.start()
 
-        for worker_id, (model_worker_recv_conn, teacher_worker_recv_conn) in enumerate(
-            zip(model_worker_recv_conns, teacher_worker_recv_conns)
-        ):
+        for worker_id, model_worker_recv_conn, model_request_queue, teacher_worker_recv_conn, teacher_request_queue in worker_specs:
             process = mp.Process(
                 target=teacher_failure_worker_loop,
                 args=(
                     worker_id,
                     task_queue,
                     result_queue,
-                    model_inference_server.request_queue,
+                    model_request_queue,
                     model_worker_recv_conn,
-                    teacher_inference_server.request_queue,
+                    teacher_request_queue,
                     teacher_worker_recv_conn,
                     args,
                     base_seed + worker_id * 100000,
@@ -1005,10 +1234,9 @@ def execute_teacher_failure_parallel(
             model_worker_recv_conn.close()
             teacher_worker_recv_conn.close()
 
-        for server_conn in model_response_conns.values():
-            server_conn.close()
-        for server_conn in teacher_response_conns.values():
-            server_conn.close()
+        for response_conns in model_response_conns + teacher_response_conns:
+            for server_conn in response_conns.values():
+                server_conn.close()
 
         completed_games = 0
         progress_bar = tqdm(total=num_games, desc=progress_desc)
@@ -1033,8 +1261,8 @@ def execute_teacher_failure_parallel(
                 raise RuntimeError(f'{progress_desc} worker exited with code {process.exitcode}')
     finally:
         _close_processes(worker_processes)
-        model_inference_server.close()
-        teacher_inference_server.close()
+        for server in model_servers + teacher_servers:
+            server.close()
         task_queue.close()
         task_queue.join_thread()
         result_queue.close()

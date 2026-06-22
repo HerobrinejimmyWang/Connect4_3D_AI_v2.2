@@ -1,8 +1,11 @@
 import math
 import itertools
+import logging
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import numpy as np
@@ -74,6 +77,39 @@ class RemoteInferenceResult:
     value: float = 0.0
 
 
+def _inference_autocast(device, precision):
+    precision = str(precision or "fp32").strip().lower()
+    if precision == "fp32":
+        return nullcontext()
+    if not str(device).startswith("cuda"):
+        raise ValueError(f"Inference precision {precision!r} requires a CUDA device.")
+    if precision == "fp16":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    if precision == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise ValueError("BF16 inference was requested but is not supported by this CUDA device.")
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    raise ValueError("inference_precision must be one of: fp32, fp16, bf16.")
+
+
+def _validate_inference_precision(device, precision):
+    precision = str(precision or "fp32").strip().lower()
+    if precision not in {"fp32", "fp16", "bf16"}:
+        raise ValueError("inference_precision must be one of: fp32, fp16, bf16.")
+    if precision != "fp32" and not str(device).startswith("cuda"):
+        raise ValueError(f"Inference precision {precision!r} requires a CUDA device.")
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA inference device {device} was requested, but CUDA is unavailable.")
+    if precision == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("BF16 inference is not supported by the selected CUDA device.")
+    return precision
+
+
+def _encode_board_batch(boards):
+    raw = np.stack(boards, axis=0)
+    return np.stack((raw > 0, raw < 0), axis=1).astype(np.float32, copy=False)
+
+
 def run_global_inference_server(
     model_state,
     model_config,
@@ -83,6 +119,8 @@ def run_global_inference_server(
     device,
     batch_size,
     batch_timeout_s,
+    inference_precision="fp32",
+    stats_queue=None,
 ):
     model_config = dict(model_config or {})
     model = Connect4Net(
@@ -98,47 +136,81 @@ def run_global_inference_server(
     if isinstance(device, str) and device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
 
-    while True:
-        if stop_event.is_set() and request_queue.empty():
-            break
-
-        batch = []
-        try:
-            first_req = request_queue.get(timeout=batch_timeout_s)
-            batch.append(first_req)
-        except queue.Empty:
-            continue
-
-        start = time.perf_counter()
-        while len(batch) < batch_size:
-            elapsed = time.perf_counter() - start
-            if elapsed >= batch_timeout_s:
-                break
+    request_count = 0
+    batch_count = 0
+    max_observed_batch = 0
+    timeout_flushes = 0
+    inference_time_s = 0.0
+    try:
+        shutdown_requested = False
+        while not shutdown_requested:
+            batch = []
             try:
-                timeout_left = max(0.0, batch_timeout_s - elapsed)
-                batch.append(request_queue.get(timeout=timeout_left))
+                first_request = request_queue.get(timeout=batch_timeout_s)
+                if first_request is None:
+                    break
+                batch.append(first_request)
             except queue.Empty:
-                break
+                continue
 
-        states = np.stack([board_to_channels(req[2]) for req in batch], axis=0).astype(np.float32)
-        tensor = torch.from_numpy(states).to(device, non_blocking=True)
+            start = time.perf_counter()
+            while len(batch) < batch_size:
+                elapsed = time.perf_counter() - start
+                if elapsed >= batch_timeout_s:
+                    break
+                try:
+                    request = request_queue.get(timeout=max(0.0, batch_timeout_s - elapsed))
+                    if request is None:
+                        shutdown_requested = True
+                        break
+                    batch.append(request)
+                except queue.Empty:
+                    break
 
-        with torch.no_grad():
-            log_pi, v = model(tensor)
+            if len(batch) < batch_size:
+                timeout_flushes += 1
+            request_count += len(batch)
+            batch_count += 1
+            max_observed_batch = max(max_observed_batch, len(batch))
+            states = _encode_board_batch([req[2] for req in batch])
+            tensor = torch.from_numpy(states).to(device)
 
-        policies = torch.exp(log_pi).cpu().numpy().astype(np.float32, copy=False)
-        values = v.squeeze(1).cpu().numpy().astype(np.float32, copy=False)
+            inference_start = time.perf_counter()
+            with torch.inference_mode():
+                with _inference_autocast(device, inference_precision):
+                    log_pi, v = model(tensor)
+            inference_time_s += time.perf_counter() - inference_start
 
-        for idx, (worker_id, request_id, _) in enumerate(batch):
-            worker_response_conns[int(worker_id)].send(
-                (int(request_id), policies[idx], float(values[idx]))
+            policies = torch.exp(log_pi.float()).cpu().numpy().astype(np.float32, copy=False)
+            values = v.float().squeeze(1).cpu().numpy().astype(np.float32, copy=False)
+            for idx, (worker_id, request_id, _) in enumerate(batch):
+                worker_response_conns[int(worker_id)].send(
+                    (int(request_id), policies[idx], float(values[idx]))
+                )
+    finally:
+        if stats_queue is not None:
+            stats_queue.put(
+                {
+                    "requests": int(request_count),
+                    "batches": int(batch_count),
+                    "average_batch_size": float(request_count / max(1, batch_count)),
+                    "max_batch_size": int(max_observed_batch),
+                    "batch_capacity": int(batch_size),
+                    "batch_fill_ratio": float(request_count / max(1, batch_count * batch_size)),
+                    "timeout_flushes": int(timeout_flushes),
+                    "inference_time_s": float(inference_time_s),
+                    "precision": str(inference_precision),
+                }
             )
-
-    for conn in worker_response_conns.values():
-        try:
-            conn.close()
-        except Exception:
-            pass
+            stats_queue.close()
+            stats_queue.join_thread()
+        for conn in worker_response_conns.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        request_queue.close()
+        request_queue.join_thread()
 
 
 class GlobalInferenceServer:
@@ -150,9 +222,13 @@ class GlobalInferenceServer:
         device="cuda",
         batch_size=32,
         batch_timeout_s=0.003,
+        inference_precision="fp32",
     ):
+        inference_precision = _validate_inference_precision(device, inference_precision)
         self.request_queue = mp.Queue()
         self.stop_event = mp.Event()
+        self.stats_queue = mp.Queue(maxsize=1)
+        self.last_stats = {}
         self.process = mp.Process(
             target=run_global_inference_server,
             args=(
@@ -164,6 +240,8 @@ class GlobalInferenceServer:
                 device,
                 max(1, int(batch_size)),
                 float(batch_timeout_s),
+                str(inference_precision),
+                self.stats_queue,
             ),
         )
 
@@ -172,12 +250,22 @@ class GlobalInferenceServer:
 
     def close(self):
         self.stop_event.set()
+        self.request_queue.put(None)
         self.process.join(timeout=5.0)
         if self.process.is_alive():
             self.process.terminate()
             self.process.join(timeout=2.0)
+        try:
+            self.last_stats = self.stats_queue.get(timeout=1.0)
+        except queue.Empty:
+            self.last_stats = {}
+        if self.last_stats:
+            logging.info("Inference server stats: %s", self.last_stats)
         self.request_queue.close()
         self.request_queue.join_thread()
+        self.stats_queue.close()
+        self.stats_queue.join_thread()
+        return dict(self.last_stats)
 
 
 class RemoteBatchInferenceClient:
@@ -211,12 +299,17 @@ class RemoteBatchInferenceClient:
 
     def close(self):
         self.stop_event.set()
+        self.receiver_thread.join(timeout=1.0)
         try:
             self.response_conn.close()
         except Exception:
             pass
-        self.receiver_thread.join(timeout=1.0)
         self._fail_pending(RuntimeError("Remote inference client closed."))
+        try:
+            self.request_queue.close()
+            self.request_queue.join_thread()
+        except (AttributeError, OSError, ValueError):
+            pass
 
     def _recv_loop(self):
         try:
@@ -339,6 +432,27 @@ class MCTS:
         self.virtual_loss = float(getattr(args, "virtual_loss", 1.0))
         self.inference_batch_size = int(getattr(args, "inference_batch_size", 32))
         self.inference_timeout_s = float(getattr(args, "inference_timeout_s", 0.003))
+        self.reuse_tree = bool(getattr(args, "reuse_mcts_tree", True))
+        self.persistent_threads = bool(getattr(args, "persistent_mcts_threads", True))
+        self.enable_search_stats = bool(getattr(args, "enable_mcts_search_stats", True))
+        self.root = None
+        self._closed = False
+        self._executor = None
+        if self.persistent_threads and self.num_worker_threads > 1:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.num_worker_threads,
+                thread_name_prefix="mcts-search",
+            )
+        self.search_stats = {
+            "root_builds": 0,
+            "root_reuses": 0,
+            "advance_reuses": 0,
+            "advance_resets": 0,
+            "retained_nodes": 0,
+            "simulations": 0,
+            "thread_tasks": 0,
+            "reset_reasons": {},
+        }
 
         # AlphaZero Dirichlet Noise parameters
         self.dirichlet_alpha = float(getattr(args, "dirichlet_alpha", 0.3))
@@ -358,10 +472,84 @@ class MCTS:
 
     def __del__(self):
         try:
-            if getattr(self, "owns_inference_manager", False) and hasattr(self, "inference_manager"):
-                self.inference_manager.close()
+            self.close()
         except Exception:
             pass
+
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+        if getattr(self, "owns_inference_manager", False) and hasattr(self, "inference_manager"):
+            self.inference_manager.close()
+
+    def get_search_stats(self):
+        stats = dict(self.search_stats)
+        stats["reset_reasons"] = dict(self.search_stats["reset_reasons"])
+        return stats
+
+    def _record_reset(self, reason):
+        self.search_stats["advance_resets"] += 1
+        reasons = self.search_stats["reset_reasons"]
+        reasons[str(reason)] = int(reasons.get(str(reason), 0)) + 1
+
+    def _new_root(self, canonical_board):
+        self.search_stats["root_builds"] += 1
+        return TreeNode(state=np.array(canonical_board, copy=True), prior_probability=1.0)
+
+    def _prepare_root(self, canonical_board):
+        canonical_board = np.asarray(canonical_board)
+        if not self.reuse_tree:
+            self.root = self._new_root(canonical_board)
+            return self.root
+        if self.root is not None and np.array_equal(self.root.state, canonical_board):
+            self.root.parent = None
+            self.search_stats["root_reuses"] += 1
+            return self.root
+        if self.root is not None:
+            self._record_reset("root_state_mismatch")
+        self.root = self._new_root(canonical_board)
+        return self.root
+
+    def _count_subtree_nodes(self, root):
+        if not self.enable_search_stats or root is None:
+            return 0
+        count = 0
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            count += 1
+            with node.lock:
+                stack.extend(node.children.values())
+        return count
+
+    def advance_to_action(self, action, next_canonical_board):
+        """Advance a retained tree after a real move, or reset safely on a miss."""
+        next_canonical_board = np.asarray(next_canonical_board)
+        if not self.reuse_tree:
+            self.root = self._new_root(next_canonical_board)
+            self._record_reset("reuse_disabled")
+            return False
+
+        child = None
+        if self.root is not None:
+            with self.root.lock:
+                child = self.root.children.get(int(action))
+        if child is not None and np.array_equal(child.state, next_canonical_board):
+            child.parent = None
+            self.root = child
+            self.search_stats["advance_reuses"] += 1
+            self.search_stats["retained_nodes"] += self._count_subtree_nodes(child)
+            return True
+
+        reason = "missing_child" if child is None else "child_state_mismatch"
+        self._record_reset(reason)
+        self.root = self._new_root(next_canonical_board)
+        return False
 
     def _normalize_probs(self, probs):
         probs = np.asarray(probs, dtype=np.float64)
@@ -372,11 +560,16 @@ class MCTS:
         return (probs / total).astype(np.float64, copy=False)
 
     def get_action_prob(self, canonical_board, temp=1, training=False, dirichlet_alpha=None, dirichlet_epsilon=None):
-        root = TreeNode(state=np.array(canonical_board, copy=True), prior_probability=1.0)
+        if self._closed:
+            raise RuntimeError("MCTS is closed.")
+        root = self._prepare_root(canonical_board)
 
         # Pre-expand the root node
-        policy, value = self.inference_manager.submit_and_wait(root.state)
-        self._expand_if_needed(root, policy, value)
+        with root.lock:
+            root_expanded = root.is_expanded
+        if not root_expanded:
+            policy, value = self.inference_manager.submit_and_wait(root.state)
+            self._expand_if_needed(root, policy, value)
 
         # Apply Dirichlet noise ONLY at the root node and ONLY during training (self-play)
         if training:
@@ -389,15 +582,24 @@ class MCTS:
         sim_counter = {"count": 0}
         counter_lock = threading.Lock()
 
-        workers = []
         total_workers = max(1, self.num_worker_threads)
-        for _ in range(total_workers):
-            worker = threading.Thread(target=self._worker_loop, args=(root, sim_counter, counter_lock), daemon=True)
-            workers.append(worker)
-            worker.start()
-
-        for worker in workers:
-            worker.join()
+        self.search_stats["thread_tasks"] += total_workers
+        if self._executor is not None:
+            futures = [
+                self._executor.submit(self._worker_loop, root, sim_counter, counter_lock)
+                for _ in range(total_workers)
+            ]
+            for future in futures:
+                future.result()
+        else:
+            workers = []
+            for _ in range(total_workers):
+                worker = threading.Thread(target=self._worker_loop, args=(root, sim_counter, counter_lock), daemon=True)
+                workers.append(worker)
+                worker.start()
+            for worker in workers:
+                worker.join()
+        self.search_stats["simulations"] += int(sim_counter["count"])
 
         counts = np.zeros(self.game.get_action_size(), dtype=np.float32)
         with root.lock:

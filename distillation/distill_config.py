@@ -150,10 +150,10 @@ CONFIG = {
         "self_play_exploration_strength": 1.0,
         "inference_batch_size": 64,
         "inference_timeout_s": 0.003,
-        "shared_inference_server_count": 4,
-        "compatible_inference_server_count": 4,
+        "shared_inference_server_count": 1,
+        "compatible_inference_server_count": 1,
         "high_mcts_shared_inference_server_threshold": 1024,
-        "high_mcts_shared_inference_server_count": 6,
+        "high_mcts_shared_inference_server_count": 1,
     },
 
     # Teacher cache generation thinking strength.
@@ -168,10 +168,10 @@ CONFIG = {
         "dirichlet_epsilon": 0.25,
         "inference_batch_size": 128,
         "inference_timeout_s": 0.001,
-        "compatible_inference_server_count": 4,
-        "shared_inference_server_count": 6,
+        "compatible_inference_server_count": 1,
+        "shared_inference_server_count": 1,
         "high_mcts_shared_inference_server_threshold": 1024,
-        "high_mcts_shared_inference_server_count": 6,
+        "high_mcts_shared_inference_server_count": 1,
     },
 
     # Student-vs-teacher adversarial collection strength.
@@ -207,10 +207,10 @@ CONFIG = {
         # Dual inference servers for adversarial stage
         "model_inference_batch_size": 128,
         "model_inference_timeout_s": 0.001,
-        "model_inference_server_count": 4,
+        "model_inference_server_count": 1,
         "teacher_inference_batch_size": 128,
         "teacher_inference_timeout_s": 0.001,
-        "teacher_inference_server_count": 4,
+        "teacher_inference_server_count": 1,
     },
 
     # -----------------------------
@@ -221,6 +221,7 @@ CONFIG = {
     "best_eval_required_generations": 2,
     "best_eval_parallelize_generations": True,
     "baseline_eval_parallelize": True,
+    "shared_evaluation_services": True,
     "best_update_threshold": 0.55,
     "eval_games_vs_teacher": 30,
     "eval_games_vs_v21_high": 30,
@@ -247,4 +248,10 @@ CONFIG = {
     "self_play_workers": 64,
     "max_self_play_workers": 64,
     "self_play_cpu_ratio": 0.75,
+    "search_thread_budget": 0,
+    "reuse_mcts_tree": True,
+    "persistent_mcts_threads": True,
+    "enable_mcts_search_stats": True,
+    "inference_precision": "fp32",
+    "compact_training_dataset": True,
 }

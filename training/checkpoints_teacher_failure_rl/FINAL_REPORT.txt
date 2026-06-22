@@ -1,0 +1,27 @@
+=== Training Final Report ===
+Planned Iterations: 217
+Completed Iterations: 217
+Self-Play Games per Iter: 160
+Model trained successfully.
+
+=== Evaluation Summary (vs Best) ===
+Number of Evaluations: 1
+Average Win Rate vs Previous Best: 0.467
+Final Best Win Rate Recorded: 0.000
+Last Eval (Iter 214 vs model.pth): Wins 14, Losses 16, Draws 0
+
+=== Self-Play Length Summary ===
+Average of Iteration Mean Steps: 22.292
+Average of Iteration Step Variance: 106.876
+Average of Iteration Policy Entropy: 0.6032
+Last Iteration Steps: mean 24.081, variance 93.050, min/max 7/68
+Last Iteration Policy Entropy: mean 0.6315, variance 0.0175, min/max 0.2673/0.8865
+
+=== Auxiliary Teacher Summary ===
+Teacher Opponent: best_new + best_old
+Number of Teacher Match Snapshots: 4
+Average Win Rate vs Teacher: 0.516
+Last Teacher Snapshot (Iter 217): Wins 74, Losses 86, Draws 0
+
+Latest training state (Resume point): /root/autodl-tmp/AI_v2.2 (2)/training/checkpoints_teacher_failure_rl/latest.pth.tar
+Final model weights (weights only): /root/autodl-tmp/AI_v2.2 (2)/training/checkpoints_teacher_failure_rl/checkpoint_217/model.pth

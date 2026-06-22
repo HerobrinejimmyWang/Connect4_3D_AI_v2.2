@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import importlib.util
 import json
 import logging
@@ -29,7 +30,12 @@ if str(TRAINING_DIR) not in sys.path:
 from game_rules import BOARD_SIZE, MAX_LAYERS, GameRules  # noqa: E402
 from model import Connect4Net, board_to_channels, build_model_config  # noqa: E402
 from model_compat import load_checkpoint_payload, load_compatible_model  # noqa: E402
-from parallel_games import execute_evaluation_parallel, execute_self_play_parallel, execute_teacher_failure_parallel  # noqa: E402
+from parallel_games import (  # noqa: E402
+    execute_evaluation_group_parallel,
+    execute_evaluation_parallel,
+    execute_self_play_parallel,
+    execute_teacher_failure_parallel,
+)
 
 
 SOURCE_SELF_PLAY = 0
@@ -37,6 +43,123 @@ SOURCE_TEACHER_WARMUP = 1
 SOURCE_TEACHER_LOSS = 2
 SOURCE_STUDENT_WIN = 3
 SOURCE_TEACHER_RESPONSE = 4
+
+CHECKPOINT_FORMAT_VERSION = 2
+PACKED_HISTORY_FORMAT = "distillation_history_v1"
+
+
+def _pack_history_entries(entries: object) -> Dict[str, object]:
+    """Pack per-iteration examples into contiguous tensors for compact serialization."""
+    packed_entries = []
+    for entry_index, entry in enumerate(list(entries or [])):
+        if not isinstance(entry, dict):
+            raise ValueError(f"History entry {entry_index} must be a dict.")
+
+        iteration = max(1, int(entry.get("iteration", 1) or 1))
+        examples = list(entry.get("examples") or [])
+        if examples:
+            try:
+                boards, policies, values, sources = zip(*examples)
+            except ValueError as exc:
+                raise ValueError(f"History entry {entry_index} contains malformed examples.") from exc
+
+            boards_raw = np.asarray(boards)
+            if boards_raw.size and not np.isin(boards_raw, (-1, 0, 1)).all():
+                raise ValueError(f"History entry {entry_index} contains invalid board cell values.")
+            boards_np = boards_raw.astype(np.int8, copy=False)
+            policies_np = np.asarray(policies, dtype=np.float32)
+            values_np = np.asarray(values, dtype=np.float32).reshape(-1)
+            sources_np = np.asarray(sources, dtype=np.int64).reshape(-1)
+        else:
+            boards_np = np.empty((0, MAX_LAYERS, BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
+            policies_np = np.empty((0, MAX_LAYERS * BOARD_SIZE * BOARD_SIZE), dtype=np.float32)
+            values_np = np.empty((0,), dtype=np.float32)
+            sources_np = np.empty((0,), dtype=np.int64)
+
+        expected_board_shape = (len(examples), MAX_LAYERS, BOARD_SIZE, BOARD_SIZE)
+        expected_policy_shape = (len(examples), MAX_LAYERS * BOARD_SIZE * BOARD_SIZE)
+        if boards_np.shape != expected_board_shape:
+            raise ValueError(
+                f"History entry {entry_index} board shape mismatch: "
+                f"expected {expected_board_shape}, got {boards_np.shape}."
+            )
+        if policies_np.shape != expected_policy_shape:
+            raise ValueError(
+                f"History entry {entry_index} policy shape mismatch: "
+                f"expected {expected_policy_shape}, got {policies_np.shape}."
+            )
+        if values_np.shape != (len(examples),) or sources_np.shape != (len(examples),):
+            raise ValueError(f"History entry {entry_index} value/source count mismatch.")
+        if policies_np.size and not np.isfinite(policies_np).all():
+            raise ValueError(f"History entry {entry_index} contains non-finite policy values.")
+        if values_np.size and not np.isfinite(values_np).all():
+            raise ValueError(f"History entry {entry_index} contains non-finite outcome values.")
+        if sources_np.size and (np.any(sources_np < 0) or np.any(sources_np > 255)):
+            raise ValueError(f"History entry {entry_index} contains an invalid source id.")
+
+        packed_entries.append(
+            {
+                "iteration": iteration,
+                "boards": torch.from_numpy(np.ascontiguousarray(boards_np)),
+                "policies": torch.from_numpy(np.ascontiguousarray(policies_np)),
+                "values": torch.from_numpy(np.ascontiguousarray(values_np)),
+                "sources": torch.from_numpy(np.ascontiguousarray(sources_np.astype(np.uint8, copy=False))),
+            }
+        )
+
+    return {"format": PACKED_HISTORY_FORMAT, "entries": packed_entries}
+
+
+def _unpack_history_entries(payload: object) -> List[Dict[str, object]]:
+    """Restore packed history using NumPy row views backed by contiguous tensors."""
+    if not isinstance(payload, dict) or payload.get("format") != PACKED_HISTORY_FORMAT:
+        return list(payload or [])
+
+    restored = []
+    for entry_index, packed in enumerate(list(payload.get("entries") or [])):
+        if not isinstance(packed, dict):
+            raise ValueError(f"Packed history entry {entry_index} must be a dict.")
+
+        boards = torch.as_tensor(packed.get("boards"), device="cpu").to(dtype=torch.int8).contiguous()
+        policies = torch.as_tensor(packed.get("policies"), device="cpu").to(dtype=torch.float32).contiguous()
+        values = torch.as_tensor(packed.get("values"), device="cpu").to(dtype=torch.float32).reshape(-1).contiguous()
+        sources = torch.as_tensor(packed.get("sources"), device="cpu").to(dtype=torch.uint8).reshape(-1).contiguous()
+        sample_count = int(values.shape[0])
+
+        expected_board_shape = (sample_count, MAX_LAYERS, BOARD_SIZE, BOARD_SIZE)
+        expected_policy_shape = (sample_count, MAX_LAYERS * BOARD_SIZE * BOARD_SIZE)
+        if tuple(boards.shape) != expected_board_shape:
+            raise ValueError(
+                f"Packed history entry {entry_index} board shape mismatch: "
+                f"expected {expected_board_shape}, got {tuple(boards.shape)}."
+            )
+        if tuple(policies.shape) != expected_policy_shape:
+            raise ValueError(
+                f"Packed history entry {entry_index} policy shape mismatch: "
+                f"expected {expected_policy_shape}, got {tuple(policies.shape)}."
+            )
+        if int(sources.shape[0]) != sample_count:
+            raise ValueError(f"Packed history entry {entry_index} source count mismatch.")
+        if policies.numel() and not bool(torch.isfinite(policies).all()):
+            raise ValueError(f"Packed history entry {entry_index} contains non-finite policy values.")
+        if values.numel() and not bool(torch.isfinite(values).all()):
+            raise ValueError(f"Packed history entry {entry_index} contains non-finite outcome values.")
+
+        boards_np = boards.numpy()
+        policies_np = policies.numpy()
+        values_np = values.numpy()
+        sources_np = sources.numpy()
+        examples = [
+            (boards_np[index], policies_np[index], float(values_np[index]), int(sources_np[index]))
+            for index in range(sample_count)
+        ]
+        restored.append(
+            {
+                "iteration": max(1, int(packed.get("iteration", 1) or 1)),
+                "examples": examples,
+            }
+        )
+    return restored
 
 
 def _strip_json_comments(text: str) -> str:
@@ -220,6 +343,7 @@ class DistillationArgs:
     best_update_threshold: float = 0.55
     best_eval_parallelize_generations: bool = True
     baseline_eval_parallelize: bool = True
+    shared_evaluation_services: bool = True
     eval_games_vs_teacher: int = 30
     eval_games_vs_v21_high: int = 30
     enable_best_refresh: bool = True
@@ -240,16 +364,22 @@ class DistillationArgs:
     self_play_workers: int = min(64, max(1, multiprocessing.cpu_count()))
     max_self_play_workers: int = max(1, multiprocessing.cpu_count())
     self_play_cpu_ratio: float = 0.75
+    search_thread_budget: int = 0
 
     cpuct: float = 1.0
     num_mcts_threads: int = 4
     virtual_loss: float = 1.0
+    reuse_mcts_tree: bool = True
+    persistent_mcts_threads: bool = True
+    enable_mcts_search_stats: bool = True
     inference_batch_size: int = 64
     inference_timeout_s: float = 0.003
-    shared_inference_server_count: int = 4 if torch.cuda.is_available() else 1
-    compatible_inference_server_count: int = 4 if torch.cuda.is_available() else 1
+    inference_precision: str = "fp32"
+    compact_training_dataset: bool = True
+    shared_inference_server_count: int = 1
+    compatible_inference_server_count: int = 1
     high_mcts_shared_inference_server_threshold: int = 1024
-    high_mcts_shared_inference_server_count: int = 6 if torch.cuda.is_available() else 1
+    high_mcts_shared_inference_server_count: int = 1
 
     dirichlet_alpha: float = 0.30
     dirichlet_epsilon: float = 0.25
@@ -263,6 +393,12 @@ class DistillationArgs:
     @classmethod
     def from_dict(cls, values: Dict[str, object]) -> "DistillationArgs":
         args = cls()
+        unknown_keys = [
+            key for key in values
+            if not hasattr(args, key) and not str(key).startswith("_comment")
+        ]
+        if unknown_keys:
+            raise ValueError(f"Unknown distillation config keys: {', '.join(sorted(unknown_keys))}")
         for key, value in values.items():
             if not hasattr(args, key):
                 continue
@@ -314,23 +450,28 @@ class DistillationArgs:
 
 
 class DistillationDataset(Dataset):
-    def __init__(self, examples: List[Tuple[np.ndarray, np.ndarray, float, int]]):
-        self.examples = list(examples)
-        if not self.examples:
-            self.boards = torch.empty((0, 2, MAX_LAYERS, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
+    def __init__(self, examples: List[Tuple[np.ndarray, np.ndarray, float, int]], compact_boards: bool = True):
+        if not examples:
+            board_shape = (0, MAX_LAYERS, BOARD_SIZE, BOARD_SIZE)
+            if not compact_boards:
+                board_shape = (0, 2, MAX_LAYERS, BOARD_SIZE, BOARD_SIZE)
+            self.boards = torch.empty(board_shape, dtype=torch.int8 if compact_boards else torch.float32)
             self.pis = torch.empty((0, MAX_LAYERS * BOARD_SIZE * BOARD_SIZE), dtype=torch.float32)
             self.vs = torch.empty((0, 1), dtype=torch.float32)
             self.sources = torch.empty((0,), dtype=torch.int64)
             return
 
-        boards, pis, vs, sources = zip(*self.examples)
-        boards_np = np.asarray(boards, dtype=np.int16)
-        encoded = np.stack([board_to_channels(board) for board in boards_np], axis=0).astype(np.float32)
+        boards, pis, vs, sources = zip(*examples)
+        boards_np = np.ascontiguousarray(np.asarray(boards, dtype=np.int8))
         pis_np = np.asarray(pis, dtype=np.float32)
         vs_np = np.asarray(vs, dtype=np.float32).reshape(-1, 1)
         src_np = np.asarray(sources, dtype=np.int64)
 
-        self.boards = torch.from_numpy(encoded)
+        if compact_boards:
+            self.boards = torch.from_numpy(boards_np)
+        else:
+            encoded = np.stack([board_to_channels(board) for board in boards_np], axis=0).astype(np.float32)
+            self.boards = torch.from_numpy(encoded)
         self.pis = torch.from_numpy(pis_np)
         self.vs = torch.from_numpy(vs_np)
         self.sources = torch.from_numpy(src_np)
@@ -352,6 +493,7 @@ class DistillationTrainer:
             logging.warning("CUDA unavailable, fallback to CPU for training and shared inference.")
             self.args.train_device = "cpu"
             self.args.shared_inference_device = "cpu"
+        self._runtime_preflight()
 
         self.game = GameRules()
         self.student_model_config = self._resolve_student_model_config()
@@ -360,6 +502,10 @@ class DistillationTrainer:
             self.student.parameters(),
             lr=float(self.args.learning_rate),
             weight_decay=float(self.args.weight_decay),
+        )
+        self.grad_scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=self.args.train_device.startswith("cuda"),
         )
         self._parsed_learning_rate_schedule = self._parse_learning_rate_schedule(
             getattr(self.args, "learning_rate_schedule", None)
@@ -391,6 +537,7 @@ class DistillationTrainer:
         self.teacher_pure_examples_history: List[Dict[str, object]] = []
 
         self.start_iteration = 1
+        self.last_checkpoint_iteration = 0
         self.eval_history: List[Dict[str, object]] = []
         self.iteration_metrics_history: List[Dict[str, object]] = []
 
@@ -460,6 +607,51 @@ class DistillationTrainer:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+
+    def _runtime_preflight(self):
+        precision = str(getattr(self.args, "inference_precision", "fp32")).lower()
+        if precision not in {"fp32", "fp16", "bf16"}:
+            raise ValueError(f"Unsupported inference_precision: {precision}")
+        inference_device = str(self.args.shared_inference_device)
+        if precision != "fp32" and not inference_device.startswith("cuda"):
+            raise ValueError(f"inference_precision={precision} requires a CUDA inference device.")
+        if precision == "bf16" and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("BF16 inference was requested but this CUDA device does not support BF16.")
+
+        cpu_count = max(1, multiprocessing.cpu_count())
+        thread_budget = int(getattr(self.args, "search_thread_budget", 0) or 0) or cpu_count
+        mcts_threads = max(1, int(getattr(self.args, "num_mcts_threads", 1) or 1))
+        worker_cap = max(1, thread_budget // mcts_threads)
+        server_count = int(getattr(self.args, "shared_inference_server_count", 1) or 1)
+        if server_count > 1 and inference_device.startswith("cuda"):
+            logging.warning(
+                "Single-GPU preflight: shared_inference_server_count=%s may waste VRAM and contend for CUDA contexts.",
+                server_count,
+            )
+        logging.info(
+            "Runtime preflight | cpu=%s search_thread_budget=%s mcts_threads=%s worker_cap=%s "
+            "inference_device=%s precision=%s servers=%s tree_reuse=%s persistent_threads=%s",
+            cpu_count,
+            thread_budget,
+            mcts_threads,
+            worker_cap,
+            inference_device,
+            precision,
+            server_count,
+            bool(getattr(self.args, "reuse_mcts_tree", True)),
+            bool(getattr(self.args, "persistent_mcts_threads", True)),
+        )
+
+    @staticmethod
+    def _file_fingerprint(path_value: object) -> Optional[str]:
+        path = Path(str(path_value)) if path_value else None
+        if path is None or not path.exists() or not path.is_file():
+            return None
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def _resolve_student_model_config(self) -> Dict[str, int]:
         active = str(self.args.active_model_preset).strip().lower()
@@ -531,14 +723,27 @@ class DistillationTrainer:
             "metadata": dict(metadata),
         }
 
-    def _resolve_worker_count(self, total_games: int) -> int:
+    def _resolve_worker_count(self, total_games: int, num_mcts_threads: Optional[int] = None) -> int:
         explicit = int(getattr(self.args, "self_play_workers", 0) or 0)
         cpu_count = max(1, multiprocessing.cpu_count())
         if explicit > 0:
             target = explicit
         else:
             target = int(cpu_count * float(self.args.self_play_cpu_ratio))
-        return max(1, min(int(self.args.max_self_play_workers), target, int(total_games)))
+        search_budget = int(getattr(self.args, "search_thread_budget", 0) or 0)
+        if search_budget <= 0:
+            search_budget = cpu_count
+        threads_per_game = max(1, int(num_mcts_threads or getattr(self.args, "num_mcts_threads", 1) or 1))
+        search_limited_workers = max(1, search_budget // threads_per_game)
+        return max(
+            1,
+            min(
+                int(self.args.max_self_play_workers),
+                target,
+                int(total_games),
+                search_limited_workers,
+            ),
+        )
 
     def _resolve_history_window_limit(self, source_bucket: str) -> int:
         global_limit = int(getattr(self.args, "history_window_len", 0) or 0)
@@ -1024,13 +1229,63 @@ class DistillationTrainer:
         self.iteration_metrics_history = compacted
 
     def _link_or_copy_file(self, source: Path, target: Path):
-        if target.exists() or target.is_symlink():
-            target.unlink()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_target = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            try:
+                os.link(str(source), str(temp_target))
+            except OSError:
+                shutil.copy2(str(source), str(temp_target))
+            os.replace(str(temp_target), str(target))
+        finally:
+            if temp_target.exists():
+                temp_target.unlink()
+
+    def _atomic_torch_save(self, payload: object, target: Path):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_target = target.with_name(f".{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            torch.save(payload, str(temp_target))
+            os.replace(str(temp_target), str(target))
+        finally:
+            if temp_target.exists():
+                temp_target.unlink()
+
+    def _capture_rng_state(self) -> Dict[str, object]:
+        cuda_state = None
+        if torch.cuda.is_available():
+            cuda_state = [state.cpu() for state in torch.cuda.get_rng_state_all()]
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state().cpu(),
+            "torch_cuda": cuda_state,
+        }
+
+    def _restore_rng_state(self, state: object):
+        if not isinstance(state, dict):
+            logging.info("Checkpoint has no RNG state; continuing from the current seeded state.")
+            return
 
         try:
-            os.link(str(source), str(target))
-        except OSError:
-            shutil.copy2(str(source), str(target))
+            random.setstate(state["python"])
+            np.random.set_state(state["numpy"])
+            torch.set_rng_state(torch.as_tensor(state["torch_cpu"], dtype=torch.uint8, device="cpu"))
+            cuda_state = state.get("torch_cuda")
+            if cuda_state is not None and torch.cuda.is_available():
+                device_count = torch.cuda.device_count()
+                if len(cuda_state) != device_count:
+                    logging.warning(
+                        "CUDA RNG device count mismatch: checkpoint=%s runtime=%s; CUDA RNG state was not restored.",
+                        len(cuda_state),
+                        device_count,
+                    )
+                else:
+                    torch.cuda.set_rng_state_all(
+                        [torch.as_tensor(item, dtype=torch.uint8, device="cpu") for item in cuda_state]
+                    )
+        except Exception as exc:
+            logging.warning("Failed to restore complete RNG state: %s", exc)
 
     def _parse_exploration_iteration_schedule(self, schedule: object) -> List[Dict[str, float]]:
         entries = []
@@ -1226,8 +1481,12 @@ class DistillationTrainer:
             num_mcts_sims=int(num_mcts_sims),
             num_mcts_threads=int(num_mcts_threads),
             virtual_loss=float(virtual_loss),
+            reuse_mcts_tree=bool(getattr(self.args, "reuse_mcts_tree", True)),
+            persistent_mcts_threads=bool(getattr(self.args, "persistent_mcts_threads", True)),
+            enable_mcts_search_stats=bool(getattr(self.args, "enable_mcts_search_stats", True)),
             inference_batch_size=int(inference_batch_size),
             inference_timeout_s=float(inference_timeout_s),
+            inference_precision=str(getattr(self.args, "inference_precision", "fp32")),
             dirichlet_alpha=float(dirichlet_alpha),
             dirichlet_epsilon=float(dirichlet_epsilon),
             self_play_exploration_strength=float(exploration_strength),
@@ -1395,6 +1654,17 @@ class DistillationTrainer:
         else:
             raise ValueError(f"Unsupported teacher cache format: {cache_path}")
 
+        cached_fingerprint = self.teacher_cache_metadata.get("teacher_model_sha256")
+        current_fingerprint = self._file_fingerprint(
+            self.teacher_model_spec.get("path") if self.teacher_model_spec else self.args.teacher_model_path
+        )
+        if cached_fingerprint and current_fingerprint and cached_fingerprint != current_fingerprint:
+            logging.warning("Teacher cache fingerprint does not match the configured teacher model.")
+        elif not cached_fingerprint:
+            logging.info("Legacy teacher cache has no model fingerprint; path/architecture compatibility only.")
+        else:
+            logging.info("Teacher model/cache fingerprint verified: %s", str(current_fingerprint)[:12])
+
         self._rebuild_teacher_cache_games_from_examples()
 
         logging.info(
@@ -1409,6 +1679,19 @@ class DistillationTrainer:
     def _summarize_runtime_games(self, game_results: List[Dict[str, object]]) -> Dict[str, object]:
         summaries = [self._build_game_summary(item) for item in list(game_results or [])]
         quality = self._summarize_game_quality(summaries)
+        search_totals: Dict[str, int] = {}
+
+        def _accumulate(stats: object):
+            if not isinstance(stats, dict):
+                return
+            for key, value in stats.items():
+                if isinstance(value, dict):
+                    _accumulate(value)
+                elif isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+                    search_totals[str(key)] = search_totals.get(str(key), 0) + int(value)
+
+        for game_result in list(game_results or []):
+            _accumulate(game_result.get("search_stats"))
         return {
             "mean_steps": float(quality.get("avg_steps", 0.0)),
             "variance_steps": float(quality.get("var_steps", 0.0)),
@@ -1425,6 +1708,7 @@ class DistillationTrainer:
             "games": int(quality.get("games", 0)),
             "shortest_game": dict(quality.get("shortest_game") or {}),
             "longest_game": dict(quality.get("longest_game") or {}),
+            "search_stats": search_totals,
         }
 
     def _save_teacher_cache(self):
@@ -1448,7 +1732,6 @@ class DistillationTrainer:
             raise RuntimeError("teacher_model_path is required for teacher data generation.")
 
         num_games = max(1, int(self.args.teacher_data_generation_games))
-        workers = self._resolve_worker_count(num_games)
         teacher_cache_sims = self._resolve_teacher_cache_num_mcts_sims()
         teacher_cache_temp = self._resolve_teacher_cache_temperature()
         teacher_cache_noise = self._resolve_teacher_cache_noise_scale()
@@ -1459,6 +1742,7 @@ class DistillationTrainer:
             noise_scale=teacher_cache_noise,
             search_profile="teacher_cache_search",
         )
+        workers = self._resolve_worker_count(num_games, parallel_args.num_mcts_threads)
 
         logging.info(
             "Generating teacher cache from model=%s with games=%s sims=%s",
@@ -1496,6 +1780,7 @@ class DistillationTrainer:
             "games": int(num_games),
             "samples": int(len(self.teacher_cache_examples)),
             "teacher_model_path": self.teacher_model_spec["path"],
+            "teacher_model_sha256": self._file_fingerprint(self.teacher_model_spec["path"]),
             "teacher_model_architecture": self.teacher_model_spec["config"].get("architecture"),
             "teacher_num_mcts_sims": int(teacher_cache_sims),
             "teacher_label_temperature": float(teacher_cache_temp),
@@ -1616,19 +1901,26 @@ class DistillationTrainer:
     def _build_checkpoint_state(self, iteration: int) -> Dict[str, object]:
         persist_teacher_histories = self._should_persist_teacher_histories(iteration)
         return {
+            "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
             "iteration": int(iteration),
             "state_dict": {k: v.detach().cpu() for k, v in self.student.state_dict().items()},
             "student_model_config": dict(self.student_model_config),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "grad_scaler": self.grad_scaler.state_dict(),
+            "rng_state": self._capture_rng_state(),
             "eval_history": list(self.eval_history),
             "iteration_metrics_history": list(self.iteration_metrics_history),
             "teacher_cache_path": str(self._teacher_cache_file()),
             "teacher_cache_metadata": dict(self.teacher_cache_metadata),
             "teacher_history_pool_size": int(len(self.teacher_history_pool)),
-            "self_play_examples_history": list(self.self_play_examples_history),
-            "adversarial_examples_history": list(self.adversarial_examples_history) if persist_teacher_histories else [],
-            "teacher_pure_examples_history": list(self.teacher_pure_examples_history) if persist_teacher_histories else [],
+            "self_play_examples_history": _pack_history_entries(self.self_play_examples_history),
+            "adversarial_examples_history": _pack_history_entries(
+                self.adversarial_examples_history if persist_teacher_histories else []
+            ),
+            "teacher_pure_examples_history": _pack_history_entries(
+                self.teacher_pure_examples_history if persist_teacher_histories else []
+            ),
             "best_recent_state": copy.deepcopy(self.best_recent_state),
             "best_older_state": copy.deepcopy(self.best_older_state),
             "no_refresh_streak": int(self.no_refresh_streak),
@@ -1658,9 +1950,10 @@ class DistillationTrainer:
             )
 
         state = self._build_checkpoint_state(iteration)
-        torch.save(state, str(checkpoint_path))
+        self._atomic_torch_save(state, checkpoint_path)
         self._link_or_copy_file(checkpoint_path, self._latest_checkpoint_path())
-        torch.save(state["state_dict"], str(model_path))
+        self._atomic_torch_save(state["state_dict"], model_path)
+        self.last_checkpoint_iteration = int(iteration)
 
         self._cleanup_old_checkpoints()
         logging.info("Saved checkpoint: %s", checkpoint_path)
@@ -1764,13 +2057,25 @@ class DistillationTrainer:
             except Exception as exc:
                 logging.warning("Failed to load scheduler state: %s", exc)
 
+        scaler_state = payload.get("grad_scaler")
+        if scaler_state is not None:
+            try:
+                self.grad_scaler.load_state_dict(scaler_state)
+            except Exception as exc:
+                logging.warning("Failed to load AMP GradScaler state: %s", exc)
+        else:
+            logging.info("Legacy checkpoint has no AMP GradScaler state; using a fresh scaler.")
+
         self.eval_history = list(payload.get("eval_history", []))
         self.iteration_metrics_history = list(payload.get("iteration_metrics_history", []))
         self._compact_iteration_metrics_history()
         self.teacher_cache_metadata = dict(payload.get("teacher_cache_metadata", self.teacher_cache_metadata))
-        restored_self_play_history_count = len(payload.get("self_play_examples_history", []) or [])
-        restored_adversarial_history_count = len(payload.get("adversarial_examples_history", []) or [])
-        restored_teacher_history_count = len(payload.get("teacher_pure_examples_history", []) or [])
+        raw_self_play_history = _unpack_history_entries(payload.get("self_play_examples_history", []))
+        raw_adversarial_history = _unpack_history_entries(payload.get("adversarial_examples_history", []))
+        raw_teacher_history = _unpack_history_entries(payload.get("teacher_pure_examples_history", []))
+        restored_self_play_history_count = len(raw_self_play_history)
+        restored_adversarial_history_count = len(raw_adversarial_history)
+        restored_teacher_history_count = len(raw_teacher_history)
 
         checkpoint_iteration = int(payload.get("iteration", 0) or 0)
         inferred_self_play_iters = self._infer_legacy_history_iterations(
@@ -1794,7 +2099,7 @@ class DistillationTrainer:
 
         self.self_play_examples_history = self._prune_history_entries(
             self._normalize_history_entries(
-                payload.get("self_play_examples_history", []),
+                raw_self_play_history,
                 checkpoint_iteration=checkpoint_iteration,
                 inferred_iterations=inferred_self_play_iters,
             ),
@@ -1803,7 +2108,7 @@ class DistillationTrainer:
         )
         self.adversarial_examples_history = self._prune_history_entries(
             self._normalize_history_entries(
-                payload.get("adversarial_examples_history", []),
+                raw_adversarial_history,
                 checkpoint_iteration=checkpoint_iteration,
                 inferred_iterations=inferred_adversarial_iters,
             ),
@@ -1812,7 +2117,7 @@ class DistillationTrainer:
         )
         self.teacher_pure_examples_history = self._prune_history_entries(
             self._normalize_history_entries(
-                payload.get("teacher_pure_examples_history", []),
+                raw_teacher_history,
                 checkpoint_iteration=checkpoint_iteration,
                 inferred_iterations=inferred_teacher_iters,
             ),
@@ -1858,9 +2163,16 @@ class DistillationTrainer:
         if self.args.continue_from_iteration is not None:
             default_start = int(self.args.continue_from_iteration)
         self.start_iteration = max(1, default_start)
+        self.last_checkpoint_iteration = int(payload.get("iteration", 0) or 0)
         self._apply_learning_rate_for_iteration(self.start_iteration)
+        self._restore_rng_state(payload.get("rng_state"))
 
-        logging.info("Resumed distillation from %s at iteration %s", checkpoint_path, self.start_iteration)
+        logging.info(
+            "Resumed distillation checkpoint format v%s from %s at iteration %s",
+            int(payload.get("checkpoint_format_version", 1) or 1),
+            checkpoint_path,
+            self.start_iteration,
+        )
 
     def _resolve_adversarial_game_count(self, iteration: int, self_play_games: int) -> int:
         if self.teacher_model_spec is None:
@@ -1955,7 +2267,10 @@ class DistillationTrainer:
         model_inference_server_count = int(profile.get("model_inference_server_count", 1))
         teacher_inference_server_count = int(profile.get("teacher_inference_server_count", 1))
 
-        workers = self._resolve_worker_count(num_games)
+        workers = self._resolve_worker_count(
+            num_games,
+            max(parallel_args.model_num_mcts_threads, parallel_args.teacher_num_mcts_threads),
+        )
         _, game_results = execute_teacher_failure_parallel(
             args=parallel_args,
             num_games=num_games,
@@ -2076,7 +2391,7 @@ class DistillationTrainer:
         )
 
         num_games = max(1, int(self.args.num_self_play_games))
-        workers = self._resolve_worker_count(num_games)
+        workers = self._resolve_worker_count(num_games, parallel_args.num_mcts_threads)
         examples, game_results = execute_self_play_parallel(
             args=parallel_args,
             num_games=num_games,
@@ -2114,9 +2429,41 @@ class DistillationTrainer:
 
         results = []
         games = max(2, int(self.args.best_eval_games_per_generation))
-        workers = self._resolve_worker_count(games)
+        workers = self._resolve_worker_count(games, eval_args.num_mcts_threads)
 
         new_model_state = {k: v.detach().cpu() for k, v in self.student.state_dict().items()}
+
+        if bool(getattr(self.args, "shared_evaluation_services", True)) and len(opponents) > 1:
+            total_workers = self._resolve_worker_count(games * len(opponents), eval_args.num_mcts_threads)
+            match_results = execute_evaluation_group_parallel(
+                args=eval_args,
+                matches=[
+                    {
+                        "label": state["label"],
+                        "num_games": games,
+                        "opponent_nnet_state": {k: v.detach().cpu() for k, v in state["state_dict"].items()},
+                        "opponent_nnet_config": dict(state["model_config"]),
+                    }
+                    for state in opponents
+                ],
+                total_workers=total_workers,
+                shared_inference_device=self.args.shared_inference_device,
+                inference_batch_size=int(eval_args.inference_batch_size),
+                inference_timeout_s=float(eval_args.inference_timeout_s),
+                new_model_state=new_model_state,
+                new_model_config=dict(self.student_model_config),
+            )
+            return [
+                {
+                    "label": state["label"],
+                    "wins": int(counts[0]),
+                    "losses": int(counts[1]),
+                    "draws": int(counts[2]),
+                    "games": int(games),
+                    "win_rate": float((counts[0] + 0.5 * counts[2]) / games),
+                }
+                for state, counts in zip(opponents, match_results)
+            ]
 
         def _run_single(state: Dict[str, object]) -> Dict[str, object]:
             wins, losses, draws = execute_evaluation_parallel(
@@ -2124,8 +2471,8 @@ class DistillationTrainer:
                 num_games=games,
                 num_workers=workers,
                 shared_inference_device=self.args.shared_inference_device,
-                inference_batch_size=int(self.args.inference_batch_size),
-                inference_timeout_s=float(self.args.inference_timeout_s),
+                inference_batch_size=int(eval_args.inference_batch_size),
+                inference_timeout_s=float(eval_args.inference_timeout_s),
                 new_model_state=new_model_state,
                 new_model_config=dict(self.student_model_config),
                 opponent_nnet_state={k: v.detach().cpu() for k, v in state["state_dict"].items()},
@@ -2163,14 +2510,14 @@ class DistillationTrainer:
             return None
 
         eval_args = self._build_eval_args(iteration)
-        workers = self._resolve_worker_count(games)
+        workers = self._resolve_worker_count(games, eval_args.num_mcts_threads)
         wins, losses, draws = execute_evaluation_parallel(
             args=eval_args,
             num_games=int(games),
             num_workers=workers,
             shared_inference_device=self.args.shared_inference_device,
-            inference_batch_size=int(self.args.inference_batch_size),
-            inference_timeout_s=float(self.args.inference_timeout_s),
+            inference_batch_size=int(eval_args.inference_batch_size),
+            inference_timeout_s=float(eval_args.inference_timeout_s),
             new_model_state={k: v.detach().cpu() for k, v in self.student.state_dict().items()},
             new_model_config=dict(self.student_model_config),
             opponent_nnet_state=None,
@@ -2200,6 +2547,43 @@ class DistillationTrainer:
         active_tasks = [task for task in tasks if task[1] is not None and task[2] > 0]
         if not active_tasks:
             return {"teacher_eval": None, "v21_eval": None}
+
+        if bool(getattr(self.args, "shared_evaluation_services", True)) and len(active_tasks) > 1:
+            eval_args = self._build_eval_args(iteration)
+            total_games = sum(task[2] for task in active_tasks)
+            total_workers = self._resolve_worker_count(total_games, eval_args.num_mcts_threads)
+            counts_list = execute_evaluation_group_parallel(
+                args=eval_args,
+                matches=[
+                    {
+                        "label": label,
+                        "num_games": games,
+                        "opponent_model_spec": {
+                            "state_dict": model_spec["state_dict"],
+                            "config": model_spec["config"],
+                        },
+                    }
+                    for _, model_spec, games, label in active_tasks
+                ],
+                total_workers=total_workers,
+                shared_inference_device=self.args.shared_inference_device,
+                inference_batch_size=int(eval_args.inference_batch_size),
+                inference_timeout_s=float(eval_args.inference_timeout_s),
+                new_model_state={k: v.detach().cpu() for k, v in self.student.state_dict().items()},
+                new_model_config=dict(self.student_model_config),
+            )
+            result_map: Dict[str, Optional[Dict[str, object]]] = {"teacher_eval": None, "v21_eval": None}
+            for (key, _, games, label), counts in zip(active_tasks, counts_list):
+                wins, losses, draws = counts
+                result_map[key] = {
+                    "label": label,
+                    "wins": int(wins),
+                    "losses": int(losses),
+                    "draws": int(draws),
+                    "games": int(games),
+                    "win_rate": float((wins + 0.5 * draws) / games),
+                }
+            return result_map
 
         def _run_single(task):
             key, model_spec, games, label = task
@@ -2253,9 +2637,9 @@ class DistillationTrainer:
         older_path = self.run_dir / "best_older.pth.tar"
 
         if self.best_recent_state is not None:
-            torch.save(self.best_recent_state, str(recent_path))
+            self._atomic_torch_save(self.best_recent_state, recent_path)
         if self.best_older_state is not None:
-            torch.save(self.best_older_state, str(older_path))
+            self._atomic_torch_save(self.best_older_state, older_path)
 
     def _run_drift_recovery_if_needed(
         self,
@@ -2321,7 +2705,28 @@ class DistillationTrainer:
 
     def train_network(self, examples: List[Tuple[np.ndarray, np.ndarray, float, int]], iteration: int) -> Dict[str, object]:
         self.student.train()
-        dataset = DistillationDataset(examples)
+        try:
+            import psutil
+
+            memory_info = psutil.Process(os.getpid()).memory_info()
+            cpu_memory_before = int(memory_info.rss)
+        except (ImportError, OSError):
+            cpu_memory_before = 0
+        dataset_pack_start = time.perf_counter()
+        dataset = DistillationDataset(
+            examples,
+            compact_boards=bool(getattr(self.args, "compact_training_dataset", True)),
+        )
+        dataset_pack_sec = time.perf_counter() - dataset_pack_start
+        dataset_bytes = sum(
+            int(tensor.numel() * tensor.element_size())
+            for tensor in (dataset.boards, dataset.pis, dataset.vs, dataset.sources)
+        )
+        try:
+            memory_info = psutil.Process(os.getpid()).memory_info()
+            cpu_peak_memory = int(getattr(memory_info, "peak_wset", memory_info.rss))
+        except (NameError, OSError):
+            cpu_peak_memory = 0
 
         if len(dataset) == 0:
             return {
@@ -2332,6 +2737,12 @@ class DistillationTrainer:
                 "self_policy_loss": 0.0,
                 "self_value_loss": 0.0,
                 "duration_sec": 0.0,
+                "dataset_pack_sec": float(dataset_pack_sec),
+                "dataset_cpu_bytes": int(dataset_bytes),
+                "cpu_peak_memory_bytes": int(cpu_peak_memory),
+                "cpu_dataset_rss_delta_bytes": int(max(0, cpu_peak_memory - cpu_memory_before)),
+                "gpu_copy_sec": 0.0,
+                "samples_per_sec": 0.0,
             }
 
         loader = DataLoader(
@@ -2343,7 +2754,6 @@ class DistillationTrainer:
         )
 
         use_cuda = self.args.train_device.startswith("cuda")
-        scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
         teacher_weight = self._resolve_teacher_weight(iteration)
         source_scales = self._source_loss_scales(iteration)
@@ -2356,16 +2766,27 @@ class DistillationTrainer:
         self_policy_sum = 0.0
         self_value_sum = 0.0
         batch_count = 0
+        processed_samples = 0
+        copy_events = []
 
         device = torch.device(self.args.train_device)
         start_ts = time.perf_counter()
 
         for _ in range(max(1, int(self.args.epochs))):
             for boards, target_pi, target_v, source in loader:
+                if use_cuda:
+                    copy_start = torch.cuda.Event(enable_timing=True)
+                    copy_end = torch.cuda.Event(enable_timing=True)
+                    copy_start.record()
                 boards = boards.to(device, non_blocking=True)
                 target_pi = target_pi.to(device, non_blocking=True)
                 target_v = target_v.to(device, non_blocking=True).view(-1)
                 source = source.to(device, non_blocking=True)
+                if use_cuda:
+                    copy_end.record()
+                    copy_events.append((copy_start, copy_end))
+                if boards.ndim == 4:
+                    boards = torch.stack((boards > 0, boards < 0), dim=1).to(dtype=torch.float32)
 
                 self.optimizer.zero_grad(set_to_none=True)
 
@@ -2401,11 +2822,11 @@ class DistillationTrainer:
                         total_loss = policy_weight * ce.mean() + value_weight * mse.mean()
 
                 if use_cuda:
-                    scaler.scale(total_loss).backward()
-                    scaler.unscale_(self.optimizer)
+                    self.grad_scaler.scale(total_loss).backward()
+                    self.grad_scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=5.0)
-                    scaler.step(self.optimizer)
-                    scaler.update()
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
                 else:
                     total_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=5.0)
@@ -2417,8 +2838,13 @@ class DistillationTrainer:
                 self_policy_sum += float(self_policy_loss.item())
                 self_value_sum += float(self_value_loss.item())
                 batch_count += 1
+                processed_samples += int(target_v.shape[0])
 
         duration = time.perf_counter() - start_ts
+        gpu_copy_sec = 0.0
+        if copy_events:
+            torch.cuda.synchronize(device)
+            gpu_copy_sec = sum(start.elapsed_time(end) for start, end in copy_events) / 1000.0
         denom = float(max(1, batch_count))
         return {
             "samples": int(len(dataset)),
@@ -2430,6 +2856,12 @@ class DistillationTrainer:
             "self_policy_loss": self_policy_sum / denom,
             "self_value_loss": self_value_sum / denom,
             "duration_sec": float(duration),
+            "dataset_pack_sec": float(dataset_pack_sec),
+            "dataset_cpu_bytes": int(dataset_bytes),
+            "cpu_peak_memory_bytes": int(cpu_peak_memory),
+            "cpu_dataset_rss_delta_bytes": int(max(0, cpu_peak_memory - cpu_memory_before)),
+            "gpu_copy_sec": float(gpu_copy_sec),
+            "samples_per_sec": float(processed_samples / max(duration, 1e-9)),
         }
 
     def _maybe_run_speed_check(self, iteration: int):
@@ -2736,7 +3168,11 @@ class DistillationTrainer:
             last_iteration = iteration
 
         if last_iteration >= self.start_iteration:
-            self.save_checkpoint(last_iteration)
+            logging.info(
+                "Training loop completed at iteration %s; latest periodic checkpoint is iteration %s.",
+                last_iteration,
+                self.last_checkpoint_iteration if self.last_checkpoint_iteration > 0 else "none",
+            )
             self._write_final_report(last_iteration)
 
     def _write_final_report(self, final_iteration: int):
@@ -2744,6 +3180,7 @@ class DistillationTrainer:
         lines = [
             "Distillation Final Report",
             f"final_iteration: {final_iteration}",
+            f"latest_checkpoint_iteration: {self.last_checkpoint_iteration}",
             f"active_model_preset: {self.args.active_model_preset}",
             f"student_model_config: {json.dumps(self.student_model_config, ensure_ascii=False)}",
             f"teacher_cache_samples: {len(self.teacher_cache_examples)}",
